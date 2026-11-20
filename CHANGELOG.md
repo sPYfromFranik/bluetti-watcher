@@ -6,6 +6,29 @@ The release notes on GitHub are this file's section for the tag.
 
 ## [Unreleased]
 
+## [1.10.4] - 2026-11-20
+
+### Fixed
+
+- Page: under the v2 modes engine an Eco or Max press in the header jumped back to Auto. The header painted the legacy
+  engine's state from `/api/now`; it now reads `GET /api/modes`, the same view the Power modes panel reads, and presses
+  through the same select. A read sent before a press never paints over it, a change still running when the page opens
+  is followed to its end, and a repaint touches only what changed, so the buttons no longer flicker.
+- Page: the rows the charts draw are merged in one place, in time order and one per time, so a row that arrives out of
+  order can no longer draw a line back across the chart or the load sparkline.
+- Page: the Reading source card no longer shows the service's English text, the token file's path or an ISO UTC time. The
+  cloud chip's tooltip and the line under the buttons are worded in the page's language (for example "Signed in until
+  21.12.2026 21:06", local time); a failed sign-in says one short sentence. Signed in with a token that still runs, the
+  Sign in button is hidden.
+- API: `GET /api/cloud` and `/api/health` give `cloud.until`, when the access token runs out (null without a readable
+  token).
+
+### Changed
+
+- Page: under the v2 engine the header shows Auto and every mode (built-in names in the page's language); modes past the
+  fourth go to a menu beside the buttons (past the third on a phone). The line under the buttons says what Auto picked.
+  The After eco row belongs to the legacy engine and is hidden under v2. The language toggle has no separator dot.
+
 ## [1.10.3] - 2026-11-20
 
 ### Fixed
