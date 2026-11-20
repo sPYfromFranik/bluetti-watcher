@@ -96,7 +96,9 @@ internal sealed class StationService(StationConfig config, IStationReader reader
 
     private static string Minutes(int sec) => $"{Fmt(sec / 60.0)} minutes";
 
-    private static string From(Reading? r) => r?.Source switch { null => "", "cloud" => " from the cloud", var s => $" from {s}" };
+    private static string From(Reading? r) => r?.Source switch { null => "", "cloud" => " from the cloud", "cloud-history" => " from the cloud history", var s => $" from {s}" };
+
+    private static bool FromCloud(string? source) => source is "cloud" or "cloud-history";
 
     /// <summary>A rebase is remembered in this cut and its confirmation is not over: hibernate waits for it.</summary>
     private bool RebaseMayDelay(StationState s) =>
@@ -148,6 +150,12 @@ internal sealed class StationService(StationConfig config, IStationReader reader
     /// <summary>The station's codes active and its over-temperature state; in memory, so a code still set after a restart is said once more.</summary>
     private IReadOnlySet<string> _stationCodes = new HashSet<string>(StringComparer.Ordinal);
     private bool _stationHot;
+    private string[] _stationWarnings = [];
+    private string[] _stationFaults = [];
+    private double? _stationTempMax;
+
+    /// <summary>The station's active warnings, faults and over-temperature as the last reading that carried them said (the tray's alarm list).</summary>
+    public StationAlarmState StationAlarmsNow => new(_stationWarnings, _stationFaults, _stationHot, _stationTempMax);
 
     /// <summary>The station's own warnings, faults and temperature (V2 stations): an event row and the config's action per change.</summary>
     private void StationAlarmEvents(StationExtras? extras, DateTimeOffset now)
@@ -155,6 +163,12 @@ internal sealed class StationService(StationConfig config, IStationReader reader
         var (codes, hot, events) = StationAlarms.Step(_stationCodes, _stationHot, extras, config.StationTempHighC);
         _stationCodes = codes;
         _stationHot = hot;
+        if (extras is { Warnings: { } warnings, Faults: { } faults })
+        {
+            _stationWarnings = [.. warnings.Distinct(StringComparer.Ordinal)];
+            _stationFaults = [.. faults.Distinct(StringComparer.Ordinal)];
+        }
+        if (extras?.TempMax is { } t) _stationTempMax = t;
         foreach (var e in events)
         {
             store.AddEvent(now, e.Kind, e.Detail);
@@ -198,7 +212,7 @@ internal sealed class StationService(StationConfig config, IStationReader reader
 
             // Spec 3.1 AC6: every cloud reading is logged with its source, and the first Bluetooth one after it.
             if (status == ReadingStatus.Rejected) log($"reading rejected{From(reading)}: {d.Rejected} (miss {_state.Misses})");
-            else if (status == ReadingStatus.Accepted && (reading!.Source == "cloud" || sourceBefore == "cloud"))
+            else if (status == ReadingStatus.Accepted && (FromCloud(reading!.Source) || FromCloud(sourceBefore)))
                 log($"reading accepted{From(reading)}: battery {Fmt(reading.Soc!.Value)} %");
             // A miss is logged at the first, at the turn to silent and every 15th after; each one is a row (an event) all the same.
             else if (status == ReadingStatus.Missed && (_state.Misses <= 1 || _state.Silent != silentBefore || _state.Misses % MissLogEvery == 0)) log($"no answer from the station (miss {_state.Misses}){(_state.Silent ? " - station silent" : "")}");
@@ -217,6 +231,9 @@ internal sealed class StationService(StationConfig config, IStationReader reader
             {
                 switch (a)
                 {
+                    case StationAction.EcoOn or StationAction.MainsBack when Modes is not null:
+                        ModesTransition(a, now);
+                        break;
                     case StationAction.EcoOn:
                         var eco = await Gated("eco-on", now, () => actions.StationEcoAsync(ct));
                         if (eco is { Ok: true })
@@ -259,6 +276,8 @@ internal sealed class StationService(StationConfig config, IStationReader reader
                 }
             }
 
+            await StepModesAsync(now, ct);
+
             // The reading goes into the flag after the mode and before a hibernation: the level is what sessions hear.
             // Best effort: a failure is an event and backs off; no level waits for it.
             if (d.Battery is { } b && BatteryWritePolicy.ShouldWrite(_battery, b, now, config))
@@ -292,7 +311,7 @@ internal sealed class StationService(StationConfig config, IStationReader reader
     private async Task<(Reading Reading, bool Accepted)?> HibernateAsync(StationDecisionResult d, CancellationToken ct)
     {
         var now = time.GetLocalNow();
-        bool killSwitch = File.Exists(KillSwitch);
+        bool killSwitch = HibernateOff;
         string? why = HibernateGuard.BeforeRead(d, killSwitch);
         if (KillSwitchHolds(killSwitch, why ?? "", now)) return null;
         Reading? fresh = null;
@@ -338,7 +357,7 @@ internal sealed class StationService(StationConfig config, IStationReader reader
     private async Task RehibernateAsync(WakeStep step, CancellationToken ct)
     {
         var now = time.GetLocalNow();
-        if (KillSwitchHolds(File.Exists(KillSwitch), "disabled by the kill switch", now)) return;
+        if (KillSwitchHolds(HibernateOff, "disabled by the kill switch", now)) return;
         double? soc = _state.LastSoc;
         if (step == WakeStep.LowOnBattery)
         {
@@ -559,8 +578,64 @@ internal sealed class StationService(StationConfig config, IStationReader reader
     public const string FlagUnreadable = "the power-mode flag is unreadable - nothing lifted";
 
     /// <summary>An emergency is on (the flag says so) or the station's emergency level is reached in this cut.</summary>
-    public bool EmergencyHolds(PowerModeFlag? flag) =>
-        flag?.Mode == "emergency" || (_state.Cut && _state.Reached[(int)LevelStep.Emergency]);
+    public bool EmergencyHolds(PowerModeFlag? flag) => flag?.Mode == "emergency" || StationEmergency;
+
+    /// <summary>The station's emergency level is reached in the cut that is on now.</summary>
+    private bool StationEmergency => _state.Cut && _state.Reached[(int)LevelStep.Emergency];
+
+    // ---- power modes v2 (modes.engine = v2) ---------------------------------------------------------------------------
+
+    /// <summary>The modes engine; null = the legacy switch path (eco / off commands, the page's Auto / Eco / Max).</summary>
+    public BluettiWatcher.Modes.ModesEngine? Modes { get; init; }
+
+    /// <summary>
+    /// Hibernation is off: the modes' autoHibernate setting, or the <c>no-hibernate</c> file on the legacy switch path (the
+    /// modes carry that file into the setting at start and rename it).
+    /// </summary>
+    private bool HibernateOff => Modes is null ? File.Exists(KillSwitch) : !Modes.AutoHibernate;
+
+    /// <summary>
+    /// Under v2 the station's eco and mains-back run no switch command (the modes own the plan and the flag word) and no
+    /// <c>actions.eco</c> / <c>actions.normal</c> line: those are the built-in Eco's command pair, run on entering and leaving it.
+    /// </summary>
+    private void ModesTransition(StationAction a, DateTimeOffset now)
+    {
+        bool eco = a == StationAction.EcoOn;
+        store.AddEvent(now, eco ? "eco-on" : "mains-back", ModesV2Detail);
+        if (!eco) Complete(a, now);
+    }
+
+    /// <summary>The detail of a station eco-on / mains-back under v2: the tray stays silent on it, the mode change notifies.</summary>
+    public const string ModesV2Detail = "modes v2: the Auto rules choose the mode";
+
+    /// <summary>The start of the next planned outage (the DTEK module's schedule); null or unset = unknown, so cutWithin rules match nothing.</summary>
+    public Func<DateTimeOffset?>? NextCut { get; set; }
+
+    private DateTimeOffset? ReadNextCut()
+    {
+        try { return NextCut?.Invoke(); }
+        catch (Exception e) when (e is not OperationCanceledException) { log($"modes: next cut unknown: {e.GetType().Name}: {e.Message}"); return null; }
+    }
+
+    /// <summary>Minutes until the next planned outage: 0 while a cut is on, null when no outage is known.</summary>
+    internal static double? MinutesToCut(bool cutOn, DateTimeOffset? nextStart, DateTimeOffset now) =>
+        cutOn ? 0 : nextStart is { } at ? Math.Max(0, (at - now).TotalMinutes) : null;
+
+    /// <summary>The modes' poll: the Auto rules see mains, battery and the outage schedule as this poll left them. A failure never stops the poll.</summary>
+    private async Task StepModesAsync(DateTimeOffset now, CancellationToken ct)
+    {
+        if (Modes is null) return;
+        (bool? on, TimeSpan? since) = _state switch
+        {
+            { Grid: Grid.Off, OffSince: { } off } => (false, now - off),
+            { Grid: Grid.On, OnSince: { } back } => (true, now - back),
+            _ => ((bool?)null, (TimeSpan?)null),
+        };
+        var input = new BluettiWatcher.Modes.SelectorInput(on, since, _state.LastSoc, MinutesToCut(_state.Cut, ReadNextCut(), now), now);
+        // The station's own emergency, from the decision state: a flag word left by an emergency that is over is the modes' to replace.
+        try { await Modes.StepAsync(input, StationEmergency, ct); }
+        catch (Exception e) when (e is not OperationCanceledException) { log($"modes: step failed: {e.GetType().Name}: {e.Message}"); }
+    }
 
     public void Compact()
     {

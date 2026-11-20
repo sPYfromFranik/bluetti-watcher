@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Reflection;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using BluettiWatcher.Decision;
 using BluettiWatcher.DtekWatcher;
 using BluettiWatcher.Io;
@@ -13,13 +14,28 @@ namespace BluettiWatcher.Http;
 /// <summary>
 /// The routes. GET /, /api/now, /api/history?from&amp;to&amp;step, /api/events?from&amp;to, /api/health;
 /// POST /api/mode { "mode": "auto" | "eco" | "max" } behind <see cref="RequestGuard"/>; GET /api/return-plan and, behind the
-/// same guard, POST /api/return-plan { "returnPlan": "high" | "balanced" | "previous" }.
+/// same guard, POST /api/return-plan { "returnPlan": "high" | "balanced" | "previous" }; GET and, behind the guard, PUT
+/// /api/settings/notifications (<see cref="Tray.NotificationSettingsApi"/>).
 /// from / to: ISO 8601 or Unix milliseconds; step: seconds (default 60).
 /// </summary>
-internal sealed class StationApi(StationConfig config, StationService service, StationStore store, TimeProvider time, DateTimeOffset startedAt, IDtekWatcher? dtek = null, Action<string>? log = null,
+internal sealed partial class StationApi(StationConfig config, StationService service, StationStore store, TimeProvider time, DateTimeOffset startedAt, IDtekWatcher? dtek = null, Action<string>? log = null,
     Func<bool>? bluetoothEncrypted = null, Func<bool>? bluetoothStalled = null, Func<(string Guid, string Name)>? activePlan = null, CloudAccount? cloud = null,
-    Func<IReadOnlyList<KeyValuePair<string, string>>>? stationBlocks = null)
+    Func<IReadOnlyList<KeyValuePair<string, string>>>? stationBlocks = null, ModesApi? modes = null, Tray.NotificationSettingsStore? notificationSettings = null,
+    Func<Modes.Broker.BrokerStatus>? broker = null)
 {
+    /// <summary>The modes routes; under v2 also the old POST /api/mode. Null = not a modes request.</summary>
+    private async Task<HttpResponse?> ModesRouteAsync(HttpRequest r, CancellationToken ct)
+    {
+        if (modes is not null && r.Path == "/api/mode")
+        {
+            if (r.Method != "POST") return HttpResponse.Text(405, "POST only");
+            if (RequestGuard.WriteRefusal(r, config.Port) is { } why) return HttpResponse.Text(403, "forbidden: " + why);
+            return await modes.LegacyModeAsync(r, ct);
+        }
+        if (!ModesApi.Owns(r.Path)) return null;
+        return modes is null ? HttpResponse.Text(409, "the modes engine is off (config modes.engine is legacy)") : await modes.HandleAsync(r, ct);
+    }
+
     /// <summary>The page, read once; encoded once per coding on first use; a reload with its ETag is a 304.</summary>
     private static readonly Lazy<StaticAsset> Page = new(() =>
     {
@@ -36,6 +52,7 @@ internal sealed class StationApi(StationConfig config, StationService service, S
     public async Task<HttpResponse> HandleAsync(HttpRequest r, CancellationToken ct)
     {
         if (!RequestGuard.HostOk(r, config.Port)) return HttpResponse.Text(403, "forbidden: foreign Host");
+        if (await ModesRouteAsync(r, ct) is { } routed) return routed;
         if (r.Path == "/api/mode")
         {
             if (r.Method != "POST") return HttpResponse.Text(405, "POST only");
@@ -48,6 +65,7 @@ internal sealed class StationApi(StationConfig config, StationService service, S
             return SetReturnPlan(r);
         }
         if (await CloudRouteAsync(r, ct) is { } cloudAnswer) return cloudAnswer;
+        if (r.Path == Tray.NotificationSettingsApi.Route && notificationSettings is not null) return Tray.NotificationSettingsApi.Handle(r, notificationSettings, config.Port);
         if (r.Method != "GET") return HttpResponse.Text(405, "GET only");
         // /api/now?settle=1: answers once the saved page choice is applied, refused or failed (bounded under the server's 10 s).
         // Both waits count against the time left in the request, so a request that started late still answers in time.
@@ -418,6 +436,35 @@ internal sealed class StationApi(StationConfig config, StationService service, S
         return string.Join(' ', words).ToLowerInvariant();
     }
 
+    /// <summary>
+    /// The rejected-reading note, coded so the page translates its reason: <see cref="StationDecision.Check"/>'s two forms
+    /// get their own codes, the missing fields as value codes or the numbers as args. Any other reason keeps the plain code
+    /// with the English reason as its arg.
+    /// </summary>
+    internal static PageNote RejectedNote(string clock, string why)
+    {
+        string text = $"reading rejected at {clock}: {why}";
+        var incomplete = IncompleteReason().Match(why);
+        if (incomplete.Success)
+        {
+            var fields = incomplete.Groups[1].Value.Split(", ").Select(f => f switch
+            {
+                "SOC" => "soc", "AC input power" => "ac-input-power", "AC output power" => "ac-output-power", "output mode" => "output-mode", _ => null,
+            }).ToList();
+            if (fields.TrueForAll(f => f is not null)) return new(PageCodes.ReadingRejectedIncomplete, text, clock, string.Join(", ", fields));
+        }
+        var implausible = ImplausibleReason().Match(why);
+        if (implausible.Success)
+            return new(PageCodes.ReadingRejectedImplausible, text, clock, implausible.Groups[1].Value, implausible.Groups[2].Value, implausible.Groups[3].Value);
+        return new(PageCodes.ReadingRejected, text, clock, why);
+    }
+
+    [GeneratedRegex(@"^incomplete \(no valid (.+)\)$")]
+    private static partial Regex IncompleteReason();
+
+    [GeneratedRegex(@"^implausible \(([0-9.]+) % after ([0-9.]+) % (-?[0-9]+) s earlier\)$")]
+    private static partial Regex ImplausibleReason();
+
     private byte[] Now(DateTimeOffset now, (string Id, string Name) plan)
     {
         var s = service.State;
@@ -432,8 +479,9 @@ internal sealed class StationApi(StationConfig config, StationService service, S
             notes.Insert(0, new(PageCodes.HibernateHeld, $"hibernate held back until {until}: the baseline moved at {moved}, the battery must stay at or under {level} %", until, moved, level));
         }
         if (s.Manual == ManualMode.Max && service.EmergencyHolds(flag)) notes.Insert(0, new(PageCodes.MaxHeld, StationService.MaxHeldBack));
-        if (s.Rejected.Length > 0 && s.RejectedAt is { } ra && (now - ra).TotalHours < 6)
-            notes.Add(new(PageCodes.ReadingRejected, $"reading rejected at {Clock(ra)}: {s.Rejected}", Clock(ra), s.Rejected));
+        // Shown only while the newest reading is the rejected one: an accepted reading after it ends the note (the log keeps it).
+        if (s.Rejected.Length > 0 && s.RejectedAt is { } ra && (now - ra).TotalHours < 6 && !(s.LastAt is { } la && la > ra))
+            notes.Add(RejectedNote(Clock(ra), s.Rejected));
         var wake = service.Wake;
         if (wake is { Error.Length: > 0 }) notes.Add(new(PageCodes.WakeDisarmFailed, $"the wake timer could not be turned off ({wake.Error}): retrying", wake.Error));
         var runtime = Runtime(last, now);
@@ -758,6 +806,15 @@ internal sealed class StationApi(StationConfig config, StationService service, S
             w.WriteStartObject("stationBlocks");
             foreach (var (name, support) in stationBlocks?.Invoke() ?? []) w.WriteString(name, support);
             w.WriteEndObject();
+            // The power modes' admin broker: missing, stale (older than this service: its elevated refresh is due) or current.
+            if (broker?.Invoke() is { } b)
+            {
+                w.WriteStartObject("broker");
+                w.WriteString("state", b.State);
+                if (b.Version is { } bv) w.WriteString("version", bv); else w.WriteNull("version");
+                if (b.Problem is { } bp) w.WriteString("problem", bp); else w.WriteNull("problem");
+                w.WriteEndObject();
+            }
             w.WriteEndObject();
         });
     }

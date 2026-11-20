@@ -26,8 +26,6 @@ pwsh -NoProfile -File install.ps1 -Mac AA:BB:CC:DD:EE:FF -CapacityWh 2048 -Apply
 
 <p align="center">
   <a href="docs/media/demo.mp4"><img src="docs/media/demo.webp" alt="The dashboard through a simulated power cut: mains lost, eco, the battery draining" width="820"></a>
-  <br>
-  <sub>The real dashboard (station.html) on demo readings through a simulated cut: about seven hours shown in 28 seconds. Recorded 28.10.2026 by <code>docs/media/record-demo.mjs</code>. <a href="docs/media/demo.mp4">MP4</a>.</sub>
 </p>
 
 > [!IMPORTANT]
@@ -55,8 +53,6 @@ flowchart LR
 
 <p align="center">
   <a href="docs/media/explainer/explainer.mp4"><img src="docs/media/explainer/explainer.webp" alt="What happens in a power cut: mains lost, eco after 3 minutes, emergency at 20 %, stop at 10 %, hibernate at 5 %, mains back" width="820"></a>
-  <br>
-  <sub>Illustration, default thresholds. Drawn by <code>docs/media/explainer/render.mjs</code>. <a href="docs/media/explainer/explainer.mp4">MP4</a>.</sub>
 </p>
 
 ## How it reacts
@@ -65,7 +61,6 @@ flowchart LR
   <source media="(prefers-color-scheme: dark)" srcset="docs/media/flow-dark.svg">
   <img alt="Battery level through one power cut and what happens at each default threshold" src="docs/media/flow-light.svg" width="100%">
 </picture>
-<p align="center"><sub>Illustration, default thresholds: mains lost, eco, 20 %, 10 %, 5 % hibernate, mains back.</sub></p>
 
 | When | What happens |
 |---|---|
@@ -107,11 +102,13 @@ Everything lands in `%LOCALAPPDATA%\bluetti-watcher` (`bin\`, `power-mode\`, `co
 for `/api/health`, registers the wake task (disabled) and creates the `Bluetti Watcher` shortcut on the Desktop and in
 the Start menu.
 
-Optional, once, from an elevated PowerShell: the GPU power cap during eco on NVIDIA cards needs two scheduled tasks
-that only an administrator can register:
+The power modes' actions that need administrator rights (services, scheduled tasks, the NVIDIA GPU power limit and
+profiles) run through the admin broker. Run the install from an elevated PowerShell and it sets the broker up too;
+from a normal one it installs the service and names the elevated step left, which you can run later, and again after
+every upgrade (`/api/health` and the tray say when it is due):
 
 ```powershell
-pwsh -NoProfile -File "$env:LOCALAPPDATA\bluetti-watcher\power-mode\power-mode.ps1" gpu-task install
+pwsh -NoProfile -File install.ps1 -Broker -Apply   # elevated, in the extracted release folder
 ```
 
 ## Features
@@ -129,15 +126,43 @@ pwsh -NoProfile -File "$env:LOCALAPPDATA\bluetti-watcher\power-mode\power-mode.p
 - Manual control on the page: Auto, Eco, Max.
 - Your own command when a mode begins (`actions`), and a flag file other programs can read.
 - Optional wake timer and DTEK planned-outage schedule (Kyiv region): an hour grid for today and tomorrow, checked against the station's own mains reading, and the hours already past show whether there really was power.
-- One NativeAOT exe, a per-user scheduled task, no window and no tray.
+- Tray icon: the charge as a number over a bar, green on mains and amber on battery; the tooltip gives watts, mode and
+  time left, a click opens Auto / Eco / Max, the panel and "Exit tray". Windows notifications for mains lost and back,
+  mode changes, low battery, failed actions and station alarms, each switchable (`--no-tray` turns both off).
+- One NativeAOT exe, a per-user scheduled task, no window.
+
+## Tray
+
+The service shows its own notification-area icon (no second program): the charge in digits over a bar, green on mains,
+amber on battery, grey when no fresh reading has come for `maxGapSec`. Hover for the watts in and out, the mode and the
+time left; click for a menu with Auto and every power mode (below), "Open panel" (this page in your browser) and
+"Exit tray" (removes the icon and its notifications until the service starts again; the service keeps running). Its
+notifications are Windows toasts for mains lost and back, the power mode changing, low battery, failed actions, an
+admin broker older than the service, and station faults, warnings and over-temperature (V2 stations); switch
+each group in `notifications.json` ([configuration.md](docs/configuration.md#notifications-notificationsjson)). The
+notifications come from the icon: with the icon closed or `"tray": false` (or `--no-tray`) there are none.
+
+## Power modes
+
+A power mode is a named list of actions the service applies to this PC: Normal, Eco and Max are built in, and you can
+add your own on the page (Power modes panel) or through the API ([api.md](docs/api.md#power-modes-modesengine--v2)).
+Auto picks the mode by rules in order: mains off or on for a while, battery under a level, a planned outage within some
+minutes (with the DTEK module), a time window; a mode you choose holds until Auto. The actions: the power plan, the
+processor's maximum state and boost, the display-off timeout, the NVIDIA GPU power limit and a driver profile, the
+display refresh rate and brightness, services and scheduled tasks, apps and Phone Link closed, a command pair from
+your config (pause a backup on entering Eco, resume it on leaving), and a watcher that logs what keeps the GPU at full
+clock. Every change is journaled and undone when the mode is left, unless you changed that setting by hand meanwhile:
+then it is left as you set it. The built-in Eco lists the optional ones off; an existing install's `actions.eco` and
+`actions.normal` become Eco's command pair. Actions that need administrator rights go through the admin broker, a
+SYSTEM task with a default-deny allow list that `install.ps1` sets up in an elevated shell; run that step again after
+each upgrade (`/api/health` and the tray say when it is due). `"modes": { "engine": "legacy" }` keeps the old
+fixed eco ([configuration.md](docs/configuration.md#power-mode-and-actions)).
 
 ## Screenshots
 
 | Ukrainian, desktop | English, phone |
 |---|---|
 | <img src="docs/media/screen-uk.png" alt="The dashboard in Ukrainian on a desktop, four hours into a cut" width="560"> | <img src="docs/media/screen-mobile.png" alt="The dashboard in English on a phone" width="220"> |
-
-<sub>Demo readings, four hours into a simulated cut. Captured by <code>docs/media/capture-screens.mjs</code>.</sub>
 
 ## Supported hardware
 
@@ -270,15 +295,14 @@ The command line: `--help`, `--version` and the power-mode switch (`power-mode s
 
 <p align="center">
   <a href="docs/demos/cli.mp4"><img src="docs/demos/cli.webp" alt="BluettiWatcher.exe --help, power-mode status and --version in PowerShell" width="820"></a>
-  <br>
-  <sub>Recorded 28.10.2026 with VHS by <code>docs/demos/cli.tape</code>: read-only commands, a demo flag file. <a href="docs/demos/cli.mp4">MP4</a>.</sub>
 </p>
 
 ## Update and uninstall
 
 To update, run `install.ps1 -Apply` from the new release's folder. `config.json`, the history and the cloud token stay;
 the new exe is staged next to the running one and swapped in seconds, and a failed health check puts the previous
-version back. What changed: [CHANGELOG.md](CHANGELOG.md).
+version back. With the admin broker installed, run `install.ps1 -Broker -Apply` from an elevated PowerShell after the
+update too: the broker runs its own copy of the exe. What changed: [CHANGELOG.md](CHANGELOG.md).
 
 Going back from 1.7 to 1.6 or older: from 1.7 an eco's end task starts `bin\BluettiWatcherService.exe`, which older
 releases do not have, so after the swap that task cannot start and the eco does not end at its time. Leave eco before

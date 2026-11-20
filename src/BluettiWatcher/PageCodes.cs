@@ -5,7 +5,8 @@ internal sealed record PageNote(string Code, string Text, params string[] Args);
 
 /// <summary>
 /// Every code the service sends the page in place of prose. The page's dictionary holds, in each language, <c>n_</c> + a note
-/// code, <c>v_</c> + a value code and <c>om_</c> + an output mode, hyphens as underscores (a test checks).
+/// code, <c>v_</c> + a value code, <c>om_</c> + an output mode, <c>st_</c> + an action state and <c>ck_</c> + a rule kind,
+/// hyphens as underscores (a test checks).
 /// </summary>
 internal static class PageCodes
 {
@@ -14,6 +15,8 @@ internal static class PageCodes
     public const string HibernateHeld = "hibernate-held";
     public const string MaxHeld = "max-held";
     public const string ReadingRejected = "reading-rejected";
+    public const string ReadingRejectedIncomplete = "reading-rejected-incomplete";
+    public const string ReadingRejectedImplausible = "reading-rejected-implausible";
     public const string WakeDisarmFailed = "wake-disarm-failed";
     // modeError and the POST's answer
     public const string EcoHeld = "eco-held";
@@ -53,7 +56,7 @@ internal static class PageCodes
     /// <summary>Every note code above (no reflection: the service is NativeAOT; a test compares it with the constants).</summary>
     public static IReadOnlyList<string> Notes { get; } =
     [
-        StationSilent, HibernateHeld, MaxHeld, ReadingRejected, WakeDisarmFailed, EcoHeld, AutoHeld, FlagUnreadable, ModeDroppedBack, ModeDroppedLost, ModeDropped,
+        StationSilent, HibernateHeld, MaxHeld, ReadingRejected, ReadingRejectedIncomplete, ReadingRejectedImplausible, WakeDisarmFailed, EcoHeld, AutoHeld, FlagUnreadable, ModeDroppedBack, ModeDroppedLost, ModeDropped,
         ModeFailed, ModeOther, MaxPinnedCut, MaxPinnedMains, EcoPinnedCut, EcoPinnedMains, AutoNext, EcoEmergency, EcoEmergencyOver, EcoMains, EcoUntil, DtekQueuesUnknown, DtekNoSchedule, DtekStale, DtekQueueNotFixed,
         DtekGroupRefuted, DtekGroupNotHouse, DtekUpdateUnreadable, DtekDatasetFailed, DtekSiteBlocked, DtekSiteFailed, DtekConfig, DtekNotStarted,
         DtekModuleError,
@@ -61,16 +64,24 @@ internal static class PageCodes
 
     /// <summary>
     /// Codes sent as values: DTEK states and sources, source states, read error classes, the page's modes, "battery lasts",
-    /// the reading sources, the cloud's states and the sign-in's (GET /api/cloud).
+    /// the reading sources, the cloud's states and the sign-in's (GET /api/cloud), the fields a rejected reading lacked.
     /// </summary>
     public static IReadOnlyList<string> Values { get; } =
         ["off", "ok", "stale", "none", "blocked", "failed", "network", "format", "dataset", "site", "auto", "eco", "max", "yes", "no", "unknown",
-         "bluetooth", "cloud", "signed-out", "sign-in-needed", "error", "idle", "waiting", "signed-in"];
+         "bluetooth", "cloud", "signed-out", "sign-in-needed", "error", "idle", "waiting", "signed-in",
+         "soc", "ac-input-power", "ac-output-power", "output-mode"];
 
     /// <summary>The station's output modes (bluetti_bt_lib enums/output_mode.py), CLOUD_MAINS (a cloud reading with AC input, design.md §4 AC2a) and BLE_MAINS (the same from a Bluetooth model with no output-mode field).</summary>
     public static IReadOnlyList<string> OutputModes { get; } = ["STOP", "INVERTER_OUTPUT", "BYPASS_OUTPUT_C", "BYPASS_OUTPUT_D", "LOAD_MATCHING", "CLOUD_MAINS", "BLE_MAINS"];
 
+    /// <summary>The modes engine's action states as /api/modes sends them (<c>ActionStatus</c>; a test compares the enum).</summary>
+    public static IReadOnlyList<string> ActionStatuses { get; } = ["unknown", "satisfied", "applied", "failed", "unsupported", "relinquished", "restore-failed"];
+
+    /// <summary>The Auto rule kinds as /api/modes sends them (<c>ConditionKind</c>; a test compares the enum).</summary>
+    public static IReadOnlyList<string> ConditionKinds { get; } = ["mainsOffFor", "mainsOnFor", "socBelow", "cutWithin", "timeWindow"];
+
     /// <summary>The page's dictionary keys for every code.</summary>
     public static IEnumerable<string> Keys() =>
-        Notes.Select(c => "n_" + c).Concat(Values.Select(c => "v_" + c)).Concat(OutputModes.Select(c => "om_" + c)).Select(k => k.Replace('-', '_'));
+        Notes.Select(c => "n_" + c).Concat(Values.Select(c => "v_" + c)).Concat(OutputModes.Select(c => "om_" + c))
+            .Concat(ActionStatuses.Select(c => "st_" + c)).Concat(ConditionKinds.Select(c => "ck_" + c)).Select(k => k.Replace('-', '_'));
 }

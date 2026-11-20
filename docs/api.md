@@ -8,10 +8,10 @@ or Unix milliseconds.
 
 - Every request: the `Host` header must be exactly `127.0.0.1:<port>` or `localhost:<port>`; anything else is `403
   forbidden: foreign Host`. This blocks DNS rebinding.
-- `POST /api/mode`, `POST /api/return-plan`, `POST /api/reading-source`, `POST /api/cloud/sign-in` and `POST /api/cloud/sign-out` also need the header `X-Station: 1` and an `Origin` that is absent or the service's own
+- `POST /api/mode`, `POST /api/return-plan`, `POST /api/reading-source`, `POST /api/cloud/sign-in`, `POST /api/cloud/sign-out` and `PUT /api/settings/notifications` also need the header `X-Station: 1` and an `Origin` that is absent or the service's own
   (`http://127.0.0.1:<port>` or `http://localhost:<port>`); else 403 with the reason. A web page on another origin
   cannot send the custom header without a CORS preflight, and the service never sends a CORS header.
-- Wrong method: 405 (`POST only` for `/api/mode`, `GET only` elsewhere; `/api/return-plan` takes both). Unknown path: 404.
+- Wrong method: 405 (`POST only` for `/api/mode`, `GET or PUT only` for `/api/settings/notifications`, `GET only` elsewhere; `/api/return-plan` takes both). Unknown path: 404.
 
 ## GET /
 
@@ -104,12 +104,13 @@ Stored events, same time defaults: `{ "events": [ { "at", "kind", "detail" } ] }
 | `uptimeSec` | Seconds since start. |
 | `dryRun` | true in a dry run. |
 | `lastPollAt`, `lastAcceptedAt` | Times of the last poll and the last accepted reading, or null. |
-| `lastSource` | `bluetooth` or `cloud`: the source of the last accepted reading, or null. |
+| `lastSource` | `bluetooth`, `cloud` or `cloud-history` (the cloud history's newest point, standing in for a device list with no live state): the source of the last accepted reading, or null. |
 | `bluetoothEncrypted` | true once the station opened the encrypted Bluetooth handshake: the built-in reader reads unencrypted stations only, so it is not connected to again until the service restarts and the cloud fallback answers. Information, not a problem: `ok` does not change. false otherwise. |
 | `readingSource` | The source in force: `auto`, `bluetooth` or `cloud` (see `/api/cloud`). |
 | `cloud` | The cloud's state `{ "state", "detail", "at" }`: `off` (the source never calls it) · `signed-out` (no token) · `ok` · `sign-in-needed` (the server refused the token refresh: sign in again) · `error` (the last read failed; `detail` names why). `at` = when it was seen, or null. Never a token. |
 | `bluetoothStalled` | true while a Bluetooth read abandoned at `readerTimeoutSec` plus 2 s (a Bluetooth call that ignored its timeout) is still running: no new Bluetooth read starts and the cloud fallback answers, until it ends or, after max(4 x that bound, 2 minutes), is given up. Information, not a problem: `ok` does not change. false otherwise. |
 | `stationBlocks` | The station's optional register blocks (`battery`, `stationTime`, `alarms`, `temperatures`) and whether it serves them: `supported`, `not supported: <why>` (until the service restarts), `not asked yet`, or `not on this protocol (V1)`. Information only. |
+| `broker` | The power modes' admin broker ([design.md](design.md) §13): `{ "state": "missing" \| "stale" \| "current", "version", "problem" }`. `stale` = its copy of the exe is older than the service: run `install.ps1 -Broker -Apply` in an elevated shell (`problem` says so; at start it is also event `broker-stale` and a tray notice). Information only: `ok` does not change. |
 | `misses` | Misses in a row. |
 | `silent` | true while the station does not answer. |
 | `rawRows`, `aggregateRows` | Rows in the database. |
@@ -158,3 +159,61 @@ mode and actions"; the power-mode commands have their own limit, `powerModeTimeo
 Answer: `{ "ok", "accepted", "manual", "modePending", "message", "code" }`. 202 = saved; the service loop applies it;
 `modePending` is the choice left for it to run (null when the press runs no command, as Auto after Max). 409 = Max or Eco refused
 during a battery emergency (`code` names it: `max-held`, `eco-held`). 400 = a body that is not JSON or a mode that is not one of the three.
+
+## Power modes (`modes.engine` = `v2`)
+
+User-defined modes, the Auto rules and per-action status ([design.md](design.md) §12). `v2` is the default; with the
+engine at `legacy` every route below answers 409; under `v2`, `POST /api/mode` selects the built-in `eco` / `max` or
+`auto` and answers like `GET /api/modes`. Writes (POST, PUT, DELETE) take the guard above (`X-Station: 1`, own or no
+`Origin`); bodies on these routes are at most 64 KB (413 above; every other route keeps 4 KB). A mode id `auto` is
+refused (400): it is the selection value of the rules. A change is saved to `modes.json`, reconciled at once, and answered with the whole view (200); a refusal
+is text: 400 a bad body or setting (each problem names its field, `actions[0].settings.plan: required`), 404 no such
+mode, 409 a conflict (a built-in deleted, a mode a rule still chooses, an id taken, `modes.json` not writable).
+
+| Route | Body / query | Does |
+|---|---|---|
+| `GET /api/modes` | | `{ engine, activeModeId, reason, emergency, actions[], restores[], problems[], settings }` |
+| `POST /api/modes` | a mode | Adds it. |
+| `PUT /api/modes/{id}` | a mode, same `id` | Replaces it; a built-in stays built in. |
+| `DELETE /api/modes/{id}` | | Removes it; built-ins (`normal`, `eco`, `max`) are not deletable. |
+| `PUT /api/modes/rules` | an array of rules | Replaces the Auto rules (order = priority). |
+| `POST /api/modes/select` | `{ "mode": "auto" \| <id> }` | A mode is held until `auto`. |
+| `GET /api/modes/catalogue` | | `{ modules: [{ descriptor, available, unavailableReason, discovery }] }`: every action type, its settings JSON Schema and UI hints, and the live lists it offers (plans, services, ...); 3 s per module. |
+| `GET /api/modes/journal` | `?since=<seq>` | `{ pageSize, records[] }`: the journal after that sequence number, 500 at most. |
+| `PUT /api/settings/hibernate` | `{ "autoHibernate": true \| false }` | Hibernation at the hibernate level on or off (the `no-hibernate` file is still honoured). |
+
+A mode: `{ "id": "quiet", "name": "Quiet", "flagWord": "normal" | "eco" | "emergency", "actions": [{ "typeId":
+"windows.powerPlan", "enabled": true, "enforce": false, "settings": { "plan": "<GUID>" } }] }`. `id`: 1-32 of `a-z 0-9 -`.
+An action of a type this build does not know is kept and shows `unsupported`.
+
+A rule: `{ "condition": { "kind": "mainsOffFor" | "mainsOnFor" | "socBelow" | "cutWithin" | "timeWindow", "seconds",
+"percent", "minutes", "from": "HH:mm", "to": "HH:mm", "hysteresis" }, "modeId": "eco" }`; only the fields of its kind are read.
+
+`actions[]`: `{ index, typeId, status, detail }` per enabled action of the active mode; `status` is `satisfied` (already
+so, nothing to undo), `applied`, `failed`, `unsupported`, `relinquished` (changed by hand: left alone), `unknown`.
+`restores[]`: resources an earlier mode left that are not back yet: `{ key, typeId, status, detail }`
+(`restore-failed` with its try count, `relinquished`, `unknown`).
+
+A module's settings form is generated from its `settingsSchema` and `uiHints` alone (the page's Power modes panel names
+no module). `uiHints` maps a field's dotted path from the settings root (`limit`, `inner.depth`) to `{ label, help,
+units, order, widget, discovery, step, labels }`: `discovery` (or `list`) names one of the module's `discovery` lists
+(a select of its labels that stores their ids; for an array, a checkbox list); `widget: "slider"` makes a number with
+both `minimum` and `maximum` a slider; `order` sorts the fields (lower first, the rest in schema order); `labels` names
+`enum` values. Without hints: `enum` = a select, `boolean` = a checkbox, `number` / `integer` = a number field with
+the schema's bounds, any other array = one item per line, `object` = a group of its own fields, several types = a text
+field; `title` and `description` are the label and the help, `default` is filled in. A stored value a list no longer
+offers stays chosen and marked "not found here".
+
+Journal record: `{ seq, at, kind: "mode" | "prepared" | "applied" | "relinquished" | "restored" | "restore-failed" | "dropped", modeId, typeId, key, before, value, final, detail }`.
+
+## GET /api/settings/notifications, PUT /api/settings/notifications
+
+Which Windows notifications show (`notifications.json`, [configuration.md](configuration.md), Notifications).
+GET answers `{ "mains", "modeChanges", "lowBattery", "failures", "faults", "overTemperature" }`, each true or false.
+PUT body: any of these keys with true or false, headers per the guard above; the rest keep their value. All or nothing:
+an unknown key or a value that is not a boolean is 400 and changes nothing. 200 answers the whole set as saved (a temp
+file moved over the old one); the next notification follows it, no restart.
+
+```powershell
+Invoke-RestMethod -Method Put -Uri http://127.0.0.1:18940/api/settings/notifications -Headers @{ 'X-Station' = '1' } -ContentType 'application/json' -Body '{"modeChanges":false}'
+```

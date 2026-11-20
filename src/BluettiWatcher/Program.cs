@@ -7,6 +7,7 @@ using BluettiWatcher.Http;
 using BluettiWatcher.Io;
 using BluettiWatcher.Io.Ble;
 using BluettiWatcher.Storage;
+using BluettiWatcher.Tray;
 
 // Command line: see Cli.Usage (--help). The service prints nothing (it logs to service.log); every other command prints
 // into the terminal it was started from.
@@ -62,34 +63,69 @@ config.PageSource = ReadingSourceFile.Read(config.DataDir, Log);
 // Under the auto source: Bluetooth first; when it misses, the BLUETTI cloud (design.md §4 Cloud fallback), on whenever its token file exists (read at each poll, so a token made while running counts) unless cloudEnabled is false.
 // The source is read at each poll: bluetooth never calls the cloud, cloud never opens Bluetooth.
 using var cloudHttp = new SocketsHttpHandler { PooledConnectionLifetime = TimeSpan.FromMinutes(10) };
-// The serial an earlier history run saved for this station type: the history session then skips the device list, which the cloud has left unanswered.
-using var cloud = BluettiCloudReader.ForService(config, cloudHttp, time, Log, store);
-// The cloud's own 5-minute history fills the database's gaps (design.md §4a): two read-only statistics calls, its own task, never on the poll path.
+// The cloud's own 5-minute history (two read-only statistics calls) fills the database's gaps in its own task (design.md §4a),
+// and its newest point stands in for a device list with no live state (§4 AC2b).
 // Its own pool: it never follows a redirect; the live reader's handler keeps its behaviour.
 using var historyHttp = CloudHistoryReader.NewHandler();
 using var historyReader = new CloudHistoryReader(historyHttp);
+// The serial an earlier history run saved for this station type: the history session then skips the device list, which the cloud has left unanswered.
+using var cloud = BluettiCloudReader.ForService(config, cloudHttp, time, Log, store, historyReader);
 using var backfill = new CloudBackfill(config, historyReader, cloud.HistorySessionAsync, store, time, Log, cloud.ForgetSerial);
 // Bluetooth: the built-in WinRT reader, IoT V1 and V2 models, read only (Io/Ble).
 var bluetooth = new NativeBleReader(config, new WinRtBleConnector(), Log);
+// Power modes v2 (modes.engine = v2): settings and journal in the data directory; the journal is replayed before any write.
+if (!config.Modes.V2On && !string.Equals(config.Modes.Engine, BluettiWatcher.Modes.ModesConfig.Legacy, StringComparison.OrdinalIgnoreCase))
+    Log($"CONFIG - modes.engine \"{config.Modes.Engine}\" is not legacy or v2: legacy is used");
+using var modes = config.Modes.V2On ? new BluettiWatcher.Modes.ModesEngine(config, new BluettiWatcher.Modes.ModuleRegistry(BluettiWatcher.Modes.ModuleCatalog.Production(config, runner, time, store.AddEvent, Log)),
+    new BluettiWatcher.Modes.ModesStore(config.DataDir), new BluettiWatcher.Modes.ModeJournal(Path.Combine(config.DataDir, BluettiWatcher.Modes.ModeJournal.FileName)),
+    new BluettiWatcher.Modes.SwitchFlagWordWriter(config, Log), time, Log, (kind, detail) => store.AddEvent(time.GetLocalNow(), kind, detail)) : null;
+modes?.Start(time.GetUtcNow() - TimeSpan.FromMilliseconds(Environment.TickCount64));
 using var service = new StationService(config, new FallbackReader(bluetooth, cloud, () => config.CloudOn, r => StationDecision.Check(r, new StationState(), time.GetUtcNow(), config), Log, () => config.CloudOnly), new PowerModeAdapter(config, runner, Log, new BluettiWatcher.PowerMode.InProcessPowerMode()),
     config.DryRun ? new DryRunHibernator(Log) : new ShutdownHibernator(runner, Log),
-    new FlagFileReader(config.FlagFile, Log, config.PowerModeMutex), store, time, Log, wake, new StateActions(config, runner, store, time, Log));
+    new FlagFileReader(config.FlagFile, Log, config.PowerModeMutex), store, time, Log, wake, new StateActions(config, runner, store, time, Log)) { Modes = modes };
 service.Compact();
 
 var started = time.GetLocalNow();
 // The outage schedule: its own task and cadence, never on the poll path; off (no source, no request) unless dtekWatcher.enabled.
 // The guard is the module's whole boundary: no call into it ever throws into this loop or into /api/now.
 using var dtek = DtekWatcherGuard.Create(config, store, time, Log);
+// The Auto rules' cutWithin reads the schedule's next planned outage (the guard never throws; off = no outage known).
+service.NextCut = () => dtek.View(service.State.Cut, null).NextStart;
 using var stop = new CancellationTokenSource();
 // The page's sign-in: the --cloud-login flow inside the service, its catcher on a port the OS assigns; the token is written through the reader's lock.
 using var signInHttp = new SocketsHttpHandler();
 using var account = new CloudAccount(config, cloud, signInHttp, time, Log, stop.Token);
+// Which notifications show: notifications.json in the data directory, edited through /api/settings/notifications.
+var notificationSettings = new NotificationSettingsStore(Path.Combine(config.DataDir, "notifications.json"), Log);
+BluettiWatcher.Modes.Broker.BrokerStatus BrokerState() => BluettiWatcher.Modes.Broker.BrokerVersion.Check(typeof(StationService).Assembly.GetName().Version ?? new Version(0, 0),
+    BluettiWatcher.Modes.Broker.BrokerVersion.Read(BluettiWatcher.Modes.Broker.BrokerPaths.Default));
 var api = new StationApi(config, service, store, time, started, dtek, Log, () => bluetooth.StationEncrypted, () => bluetooth.BluetoothStalled,
         () =>
         {
             using var planSwitch = new BluettiWatcher.PowerMode.PowerModeSwitch([.. BluettiWatcher.PowerMode.PowerModeSwitch.ProcessEnvironment(), .. config.PowerModeEnvironment], TextWriter.Null);
             return planSwitch.ActivePlan();
-        }, account, bluetooth.StationBlocks);
+        }, account, bluetooth.StationBlocks, modes is null ? null : new ModesApi(config, modes), notificationSettings, BrokerState);
+// The notification-area icon and the notifications: a thread of this process, only in an interactive session (README, Tray).
+using var trayHost = config.Tray && Environment.UserInteractive
+    ? TrayHost.Start(modes is null ? new ManualTrayModes(service) : new ModesTrayModes(modes), new Uri($"http://127.0.0.1:{config.Port}/"), time.LocalTimeZone, Log)
+    : null;
+var tray = trayHost is null ? null : new TrayController(trayHost, notificationSettings);
+if (tray is not null) store.EventAdded = tray.OnEvent;
+void ShowTray()
+{
+    if (tray is null) return;
+    var at = time.GetLocalNow();
+    var last = service.LastAccepted;
+    tray.Update(TraySnapshot.From(last, service.LastAcceptedAt, service.State, service.LastFlag, api.Runtime(last, at).HoursLeft, at, config.MaxGapSec));
+    tray.ReportAlarms(StationAlarm.ListOf(service.StationAlarmsNow));
+}
+ShowTray();
+// A broker older than this service (its copy is refreshed only by the elevated install step) is said at start: event, log, tray notice.
+if (modes is not null && BrokerState() is { State: "stale", Problem: { } staleBroker })
+{
+    Log($"WARNING - {staleBroker}");
+    store.AddEvent(time.GetLocalNow(), BluettiWatcher.Modes.Broker.BrokerVersion.StaleEvent, staleBroker);
+}
 using var http = new MiniHttpServer(IPAddress.Loopback, config.Port, api.HandleAsync, Log);
 try { http.Start(); }
 catch (SocketException e) { Log($"DID NOT RUN - 127.0.0.1:{config.Port} is taken ({e.SocketErrorCode})"); return 2; }
@@ -137,6 +173,9 @@ try
         // A page choice saved by POST /api/mode runs here, with the power-mode timeout, never the request's.
         try { await service.ApplyPendingAsync(stop.Token); }
         catch (Exception e) when (e is not OperationCanceledException) { Log($"mode change failed: {e.GetType().Name}: {e.Message}"); }
+        // After each poll and each page or tray choice: the icon is redrawn only when what it shows changed.
+        try { ShowTray(); }
+        catch (Exception e) when (e is not OperationCanceledException) { Log($"tray update failed: {e.GetType().Name}: {e.Message}"); }
         if (time.GetElapsedTime(lastCompact).TotalHours >= 1) { service.Compact(); lastCompact = time.GetTimestamp(); }
         await service.WaitForWorkAsync(schedule.Wait, stop.Token);
     }

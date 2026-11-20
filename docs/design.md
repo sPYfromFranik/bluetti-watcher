@@ -17,13 +17,13 @@ read-only features to come, are mapped in [bluetti-protocol.md](bluetti-protocol
 - Read only toward the station, forever. The Bluetooth reader can build one kind of frame, a read of holding
   registers (Modbus function 0x03) under register 2000, and its only GATT writes are that request and the
   notification subscription.
-- The BLUETTI cloud fallback (section 4) is read only the same way: it reads the device list and refreshes its token,
-  and its history back-fill (section 4a) reads two statistics endpoints, nothing else.
+- The BLUETTI cloud fallback (section 4) is read only the same way: it reads the station's live state and the device
+  list and refreshes its token, and its history back-fill (section 4a) reads two statistics endpoints, nothing else.
 - Never blocks or harms the PC on bad data: unknown beats wrong.
 
 ## 2. Architecture
 
-1. A per-user background process, no window and no tray, started at logon by a scheduled task as the user (Medium
+1. A per-user background process, no window (the notification-area icon of §14 is its only UI besides the page), started at logon by a scheduled task as the user (Medium
    integrity, "run only when the user is logged on"), restarted on failure; nothing before logon. It must never run in
    session 0: the power-mode mutex is a `Local\` name shared with the user's own scripts. A start in session 0 exits 2.
 2. Host: one C# NativeAOT exe (`BluettiWatcher.exe`), a console program: a terminal waits for `--help`, `--version` or
@@ -48,8 +48,10 @@ read-only features to come, are mapped in [bluetti-protocol.md](bluetti-protocol
    shown on the page; the pack current does not feed the runtime estimate (the app reads it unsigned, so it does not say
    charge from discharge, and no V2 station was available to validate it). A new warning or fault, a code that clears
    and a temperature above `stationTempHighC` (re-armed 5 °C under it) each write an event row and run the matching
-   `actions` command. When opening the connection fails (GATT Unreachable, no ff01/ff02), the poll opens once more
-   before it gives up; when `readerTimeoutSec` runs out, the fields already read are kept as a partial reading and the log
+   `actions` command. Each connection open is capped at 40 % of `readerTimeoutSec` (12 s at the default 30 s) and cut
+   there even when the Bluetooth call ignores its cancellation (a link it hands over later is released), so two opens
+   leave at least 20 % of the budget for the register reads. When opening the connection fails (GATT Unreachable, no
+   ff01/ff02, the cap), the poll opens once more before it gives up; when `readerTimeoutSec` runs out, the fields already read are kept as a partial reading and the log
    names what the read was waiting for. An answer that timed out or came back invalid
    ends its connection and the next request goes over a new one; as a reconnect may reuse the radio link, an answer
    that an earlier unanswered request (of this poll or an earlier one) could have sent (same byte count, so any
@@ -137,9 +139,11 @@ store's upserts need it), named in one `service.log` line with the version found
 
 ## 4. Cloud fallback
 
-When Bluetooth does not answer, the reading may come from the BLUETTI cloud
-(`GET https://gw.bluettipower.com/api/bluiotdata/ha/v2/devices`, the API of BLUETTI's official Home Assistant
-integration) with the token in `cloud-token.json` (`cloudTokenPath`, default the data directory). It is opt-in:
+When Bluetooth does not answer, the reading may come from the BLUETTI cloud: the live state the official app reads
+(`POST https://gw.bluettipower.com/api/bluiotdata/realtime/v1/getDeviceLastAlive`, body `{"deviceSn"}`), with the token
+of BLUETTI's official Home Assistant integration in `cloud-token.json` (`cloudTokenPath`, default the data directory).
+The station's serial comes from that integration's device list (`GET .../api/bluiotdata/ha/v2/devices`), read only
+while no serial is known (none saved, or the history refused it); its values are never a reading. It is opt-in:
 `cloudEnabled` not set = on when the token file exists (checked at each poll); `true` = on; `false` = off.
 
 ### Reading source
@@ -187,18 +191,31 @@ file) · `ok` (the last read answered, or signed in and not read yet; the detail
   turns the state to `sign-in-needed` (AC10); another failure shows as `error` and waits an hour.
 
 - AC1: when Bluetooth returns a reading, the cloud is not called.
-- AC2: when Bluetooth returns nothing and the cloud returns the station (model starting with `type`, `online` "1",
-  `SOC` numeric), the reading is Soc = `SOC`, InAc = `GridAllTotalPower`, OutAc = `ACLoadAllTotalPower` if present
-  else null, the DC and voltage fields null.
+- AC2: when Bluetooth returns nothing and getDeviceLastAlive answers `allFieldIsNull` false, a numeric `batterySoc`
+  and a `timestamp` at most `cloudLiveMaxAgeSec` (120) seconds off the clock either way, the reading is Soc =
+  `batterySoc`, InAc = `powerGridIn`, OutAc = `powerAcOut`, InDc = `powerPvIn`, OutDc = `powerDcOut` (numbers as
+  strings or numbers; null = unknown), the voltage fields null, `lastSource` `cloud`. The `timestamp` is the station's
+  local time, read in this machine's time zone (the station and the machine are taken to share one zone; in the hour
+  a clock change repeats, the reading nearer now).
 - AC2a: the cloud has no output mode, and a reading without one is incomplete (section 3). The mode is derived:
-  `GridAllTotalPower` > 0 = `CLOUD_MAINS` (mains is on whatever the mode); `GridAllTotalPower` 0 with `SetCtrlAc` 1
-  and `ACLoadAllTotalPower` > 0 = `INVERTER_OUTPUT` (the AC load runs from the battery); anything else = no mode, so
-  the reading is incomplete. The cloud has answered an all-zero device state (SOC 0 %, 0 W in, 0 W out) while the
-  station ran on Bluetooth at a real charge: that answer derives no mode and is rejected as incomplete, which keeps a
-  false 0 % away from the stop and hibernate levels.
-- AC3: when the device is offline (`online` not "1"), the answer is not `msgCode` 0, `SOC` is missing or not a
-  number, HTTP fails or times out (15 s cap; a device list request with no answer at all is sent once more), or the
-  token file is missing or unreadable, the result is a miss with one log line naming why, never the token.
+  `powerGridIn` > 0 = `CLOUD_MAINS` (mains is on whatever the mode); `powerGridIn` 0 with `acSwitch` 1 and
+  `powerAcOut` > 0 = `INVERTER_OUTPUT` (the AC load runs from the battery); anything else = no mode, so the reading is
+  incomplete.
+- AC2b: the HA device list answered an all-zero state (SOC 0 %, 0 W in, 0 W out) for an AC200PL running on Bluetooth
+  at a real charge, while getDeviceLastAlive answered its real state. A live state with every field null
+  (`allFieldIsNull` true), no numeric SOC, a timestamp outside `cloudLiveMaxAgeSec`, or all zero is no live state:
+  never a reading, so a false 0 % never reaches the stop and hibernate levels nor a stored row. The newest point of today on the history's
+  power curve (§4a, the same read-only call) is the reading instead, `lastSource` `cloud-history`, while it is at most
+  `cloudHistoryMaxAgeMin` (10) minutes old; its mode is derived as in AC2a with the AC output taken as on when it feeds
+  a load, and the decision's checks (AC9 stale included) apply as to any cloud reading. At most one history call each
+  5 minutes (the last answer serves between them), counted in the back-fill's daily cap of 40 calls. An older or
+  missing point, a failed call or the cap reached is a plain miss (no reading). "cloud: no live state from
+  getDeviceLastAlive (<reason>)" is logged once until it answers a live state again; the history's outcome once each
+  time it changes.
+- AC3: when the answer is not `msgCode` 0, the device list holds no station of `type` (while the serial is looked
+  up), HTTP fails or times out (15 s cap; a live-state or device-list request with no answer at all is sent once
+  more), or the token file is missing or unreadable, the result is a miss with one log line naming why, never the
+  token. An offline station answers an old timestamp: no live state (AC2b).
 - AC4: when the access token expires within 3 days (`created_at` + `expires_in`) or the API answers `msgCode` 805,
   the reader refreshes once (`POST https://sso.bluettipower.com/oauth2/token`, `grant_type=refresh_token`), writes the
   token file atomically (temp file flushed to disk, then replace) and retries once; a failed refresh after 805 is a
@@ -207,8 +224,9 @@ file) · `ok` (the last read answered, or signed in and not read yet; the detail
 - AC4a: when a refresh succeeded but the token file cannot be written, the new pair is used from memory, logged, and
   written again on every poll until it is written; a pair the server issued is never thrown away. A token file that
   is not JSON (torn, zeroed) is logged as such.
-- AC5: the cloud client only GETs the devices endpoint and POSTs the token endpoint; no control, fulfilment or bind
-  call exists in the code (a test checks the client's URLs against an allow-list).
+- AC5: the cloud client only GETs the devices endpoint and POSTs the live-state and token endpoints (and the history's,
+  section 4a); no control, fulfilment or bind call exists in the code (a test checks the client's URLs against an
+  allow-list).
 - AC6: each accepted reading carries its source (`bluetooth` or `cloud`): every accepted cloud reading and the first
   Bluetooth one after it are logged with it (unchanged repeats folded into a count, section 2), a rejected reading's
   log line names it, and `/api/health` gives
@@ -361,7 +379,9 @@ least every `batteryRefreshSec` (600 s); this write is best effort.
   Still at or under the level on battery, the PC hibernates again once they hold; this is intended.
 - A failing action backs off: 1, 2, 4, 8 minutes, then every 10 minutes, each failure an event shown on the page; no
   retry loop at the poll rate.
-- Kill switch: a file `no-hibernate` in the data directory turns hibernation off. It is checked on every poll and only
+- Kill switch: under the modes v2 the `autoHibernate` setting (§12); the file `no-hibernate` it replaces is carried
+  into it at start (`autoHibernate` false) and renamed `no-hibernate.migrated`, so turning the setting on hibernates
+  again. On the legacy switch path a file `no-hibernate` in the data directory turns hibernation off. It is checked on every poll and only
   its `hibernate-refused` event backs off, so removing the file is heard at the next poll. A dry run (`--dry-run`)
   logs every command and hibernation instead of running it; its `hibernate-skipped` attempt backs off whole.
 
@@ -501,7 +521,11 @@ changes a decision. Use it to stop a heavy program when eco starts, or to notify
   switch in the header remembers the choice in the browser.
 - Prose the page shows also comes with a stable code it translates by (`notes`, `ecoNote`, `modeErrorNote`,
   `dtekWatcher.notes`: `{code, text, args}`; `modeCode`, the station's output mode; the mode POST's `code`); an unknown
-  code shows the server's text.
+  code shows the server's text. A rejected reading's reason has its own codes (`reading-rejected-incomplete` with the
+  missing fields as value codes, `reading-rejected-implausible` with the two levels and the seconds); logs and the
+  note's `text` stay English.
+- The rejected-reading note stands only while the newest reading is the rejected one (at most 6 hours): a reading
+  accepted after it ends the note; the log keeps the rejection.
 - Times shown to people (page, notes, log texts) use the PC's local time zone. API times are ISO 8601 with the local
   offset. DTEK schedule math stays in Europe/Kyiv time, because the source publishes Kyiv wall time.
 
@@ -685,3 +709,162 @@ those three calls and the `dtekWatcher` config property.
     window would otherwise fit it (both ends within 20 minutes). A cut of exactly `minCutMin` counts. Short cuts stay
     in the cut history and on the chart, and a running cut is overdue and shown as before: the minimum applies when
     the cut ends.
+
+## 12. Power modes (`modes.engine` = `v2`)
+
+On by default since 1.8.0 (`modes.engine` = `legacy` keeps §5's fixed eco). Code in `src/BluettiWatcher/Modes/`; API
+in [api.md](api.md), Power modes.
+
+1. A **mode** is a named list of actions (`{ typeId, enabled, enforce, settings }`) plus the flag word it maps to
+   (`normal`, `eco`, `emergency`). Exactly one mode is active. Built-ins `normal`, `eco`, `max` are editable, never
+   deletable; a missing one is re-added at start.
+2. An **action module** (`IActionModule`) is one capability: its descriptor (type id, settings JSON Schema, UI hints,
+   discovery list names, restoration class, needs-admin, default settings) and an adapter that discovers choices,
+   validates settings, expands them into **resource intents** (one per field: `windows.activePlan`, `gpu/0/powerLimit`,
+   `service/<name>/running`), reads, compares and writes one resource, answering with the value read back. Modules
+   are registered by hand (`ModuleCatalog`, no reflection: NativeAOT); the registry refuses a duplicate type id or
+   defaults that fail their own schema. Settings are checked against the schema (type, properties, required,
+   additionalProperties, enum, minimum, maximum, minLength, maxLength, items, maxItems) and the module's own checks
+   before they are saved. A mode id is 1-32 of `a-z 0-9 -`; `auto` is reserved (it selects the rules). The modules
+   (restoration class in brackets; * = writes through the admin broker, §13):
+   - `windows.powerPlan` (reversible): the active power plan.
+   - `windows.cpuPolicy` (reversible): the processor's maximum state and boost mode of a plan, on mains and on battery
+     (`plan`: a GUID or `active`; with `active` a plan switch during the mode leaves the old plan holding the mode's values).
+   - `display.offTimeout` (reversible): the display-off timeout of the active plan, on battery and on mains.
+   - `gpu.powerLimit`* (reversible): the NVIDIA board power limit of one GPU (`gpu`: its index), set as exactly one of
+     `percent` of its default limit, `watts`, or `limit: "min"` (the card's own minimum, read from nvidia-smi: a percent
+     cannot name it portably); the broker checks the card's min..max again. Eco's built-in GPU action is `limit: "min"`.
+   - `display.refreshRate` (reversible), `display.brightness` (reversible, DDC/CI monitors).
+   - `nvidia.profile`* (compensatable): a Profile Inspector `.nip` imported, the customised profiles exported first
+     and imported back on leaving. Its read is a broker export, so it is read and written on entering and leaving the
+     mode, not at every poll; a failed read is tried again at the next poll.
+   - `gpu.idleWatcher` (token): writes nothing; logs the processes holding a GPU that stays in P0 at a high clock with
+     next to no load, once per idle stretch.
+   - `service.state`* (reversible): a service's running state and start type (Windows Search, Xbox gaming services, ...).
+   - `scheduledTask.state` (reversible): a scheduled task enabled or disabled.
+   - `process.close`, `windows.phoneLink` (irreversible): apps closed, Phone Link closed.
+   - `command.pair` (compensatable): a named command (`modes.commands`) on entering and another on leaving. The module
+     cannot read what its commands changed, so its read is its memory of what it ran; after a restart the reconciler
+     hands it the journaled target of every pair it still owns (`IRecallsWrites`), so leaving still runs the leave
+     command.
+3. **Selection.** A manual pick holds until Auto. Auto takes the first rule (in order) whose condition holds:
+   `mainsOffFor` / `mainsOnFor` N s (mains as the decision confirmed it), `socBelow` X %, `cutWithin` N min (the DTEK
+   module's next planned outage, §11; 0 while a cut is on; with the module off or failing it never matches), `timeWindow` from-to local time (may wrap midnight). A rule in force keeps matching within its
+   hysteresis (SoC points, minutes; a mains rule for its whole spell); when no rule matches, the last mode stays.
+   Unknown inputs match nothing. The default rules reproduce §5: `eco` after `mainsLostSec` off, `normal` after
+   `mainsBackSec` on. A battery emergency (§6) overrides both: the mode's actions stay and the engine never writes
+   over the flag's `emergency` while the station's emergency level holds in the cut that is on (the decision's state,
+   not the flag); once mains is back the engine writes the mode's word over the emergency left in the flag.
+4. **Reconciler.** Each poll, and at once after an API change, for every resource of the active mode: read; a failed
+   read writes nothing and claims nothing (status `failed`); equivalent to the target = `satisfied`, nothing to undo;
+   else `Prepared(before, target)` is journaled, the module writes and reads back, `Applied(written)` is journaled and
+   the resource is owned. A resource is ours only while it reads what we wrote. A resource the person changed is let go
+   (`relinquished`, event `mode-drift`) and not touched again while the mode stays active, unless its action has
+   `enforce`: then it is written back on that poll. Leaving a mode restores each owned resource the new mode does not
+   set to its baseline (the value before the first write), only while it is still ours; a failed restore is retried on
+   later polls, at most 3 times, then reported (`restore-failed`, event `action-failed`) and given up. A resource the
+   next mode also sets keeps its first baseline. Irreversible actions (closing apps) are never undone. One action's
+   failure never stops the others. A failed write is tried again after 1, 2, 4 ... minutes, at most 30 apart, and
+   alerted once (event `action-failed`) per resource and mode entry; entering a mode or a write that succeeds starts
+   afresh.
+5. **Journal** `modes-journal.jsonl` in the data directory: one JSON line per record, written and flushed to disk
+   before the step it records goes on. Replayed at start before any write: a `Prepared` with no outcome is settled by
+   reading (the target = owned, the baseline = dropped, anything else = relinquished; an unreadable resource stays
+   open and is never written over); a token resource (a pause) written before the last boot is let go. A torn last line
+   (a crash mid-write; never acted on) is cut off. Any other unreadable line: the journal is moved aside
+   (`.corrupt-<unix>`), nothing is restored, the fallback mode (`normal`) is held as a manual pick until Auto is
+   pressed, and the problem is shown in `/api/modes` and as event `modes-problem`. Compacted at each start and past
+   5000 records: kept are the records a replay rebuilds each owned resource from, the last mode entered and the last
+   200 records (sequence numbers unchanged); written to a temporary file and moved over the journal.
+6. **Settings** `modes.json` in the data directory, versioned, replaced atomically. First start: an install that ran
+   the switch before (its flag or `power-mode.config.json` exists) is migrated: `returnPlan` becomes Normal's plan
+   (`previous` = no plan action, so leaving Eco restores whatever plan was active before it), `gpuCap` turns Eco's GPU
+   limit on or off; a fresh install gets the public defaults (Eco =
+   Power saver, its GPU limit, a command pair, services, Phone Link and the GPU idle watcher listed but off; Max = High
+   performance). The config's `actions.eco` / `actions.normal` become the commands `eco` / `normal` and the built-in
+   Eco's command pair runs them on entering and leaving Eco (configuration.md, Power mode and actions); under `v2` the
+   station's eco and mains-back no longer fire them. The other `actions` keys fire as before. A file this build cannot parse is moved aside and
+   replaced; one from a newer build is left alone and the defaults run in memory.
+7. **Flag.** The active mode's flag word is written through the switch's own flag code (same lock, same format; the
+   battery fields and any plan or GPU limit an older eco still owes are carried over), so its readers are unchanged.
+   Under `v2` the station's eco and mains-back run no switch command; the station emergency still does (§6).
+8. **Page.** The station page has a Power modes panel, shown only under `v2` and asked nothing while it is closed (open:
+   the catalogue once, `/api/modes` each minute; `/#modes` opens it): Auto or a mode, why the mode is in force (the
+   rule in the page's language), a chip per action state with its reason, the hibernate setting, the modes (built-ins
+   not deletable) with an editor whose settings forms are generated from the catalogue (api.md, Power modes), and the
+   Auto rules with up/down ordering and an editor per condition kind (times as `HH:mm`, 24-hour). A refused save shows
+   each problem at its field and keeps the edit; an emptied rule value is refused before it is sent.
+
+## 13. Admin broker (power modes)
+
+Some mode actions need administrator rights (a service's start or start type, a scheduled task, a GPU power limit, an
+NVIDIA driver profile). The service never runs elevated; it asks one SYSTEM scheduled task, `BluettiWatcherBroker`, with
+no trigger, which it starts on demand (`schtasks /run`), and waits up to 10 s for the answer.
+
+- Folders: what SYSTEM trusts sits in `%ProgramFiles%\BluettiWatcher\broker` (`bin\` with the copy of
+  `BluettiWatcher.exe` the task runs, `policy.json`, `profiles\`, `exports\`, `broker.log`); the requests and answers
+  in their own root, `%ProgramData%\BluettiWatcherBroker` (`requests\`, `responses\`), never inside the flag's folder,
+  which the user may change. Both roots are owned by Administrators with inheritance cut: Administrators and SYSTEM
+  full control, the user read and traverse only; in `requests\` the user may also add files (never folders), and on
+  the files it adds read, write and delete (the client writes `.tmp` and renames it). Every child is reset to inherit
+  only that (a pre-created one loses its own entries). SYSTEM never runs the exe in the user's own bin, which the user
+  can replace, nor an exe from the exchange root. Before anything changes, the install refuses (exit 1) when an
+  existing ancestor of either root is owned by the user or grants the user delete, delete-child, change-permissions,
+  take-ownership, add-file or add-folder (the groups every user is in: the first four) - an ACL that cannot be read
+  refuses too; after setting them it reads the ACLs back and fails on any difference. The policy's user is the user
+  the service's logon task runs as (its principal), never the elevated caller. A 1.8.0 pre-release broker under
+  `%ProgramData%\BluettiWatcher\broker` is carried out (its policy and `.nip` profiles only when Administrators own
+  them) and removed. `install.ps1 -Broker -Apply` (elevated) creates it all; the normal `install.ps1 -Apply` runs
+  that step too when its shell is elevated, else it names it as the step left to run. Once the broker is registered, the switch's old GPU cap tasks (`<prefix>GpuCap`,
+  `<prefix>GpuRestore`) are removed: the broker's `gpu.setPowerLimit` replaces them. After an upgrade the copy is
+  stale until that step runs again: the service compares the copy's file version with its own and names a missing or
+  older broker in `/api/health` (`broker`), and an older one at start as event `broker-stale` (a tray notice).
+- Request: `requests\<id>.json` (`{ v, id, op, args, issued }`, id = 32 hex digits, written as `.tmp` and renamed into
+  place); answer: `responses\<id>.json` (`{ id, ok, error, value }`), pruned after 10 minutes. The broker logs every
+  request to `broker.log` in its Program Files folder.
+- Default deny. A request runs only when: `policy.json` is a plain file owned by Administrators (or SYSTEM) that no other
+  account may write, and parses strictly (an unknown key, a wrong type or a bad name invalidates it - then everything
+  is refused); the request file is a plain file (no link, one name) owned by the policy's user or an administrator,
+  opened without following links and deleted through the same handle; it is under 4 KB, well-formed, issued within the
+  last 30 s; its operation is known and its arguments are exactly the operation's.
+- Operations: `service.query|start|stop|setStartType` and `task.enable|disable` for names the policy lists;
+  `gpu.query`, `gpu.setPowerLimit` within the GPU's own min..max read at the time; `nvidia.exportProfiles` (Profile
+  Inspector `-exportCustomized`; the file is moved into `exports\` and answered with its SHA-256) and
+  `nvidia.applyProfile` (`-silentImport -replaceImport`) for a listed `.nip` in `profiles\` or a file in `exports\`.
+  Profile Inspector must sit under Program Files or the broker folder. Nothing from a request reaches a shell: services
+  and tasks go by their policy spelling, numbers are re-formatted, files are names joined to a fixed folder.
+- `BluettiWatcher.exe --broker-allow service|task|profile|inspector <name>` (elevated) adds to the policy.
+
+## 14. Tray and notifications
+
+1. The icon lives in the service process: one more thread (STA) with a hidden top-level window and a blocking
+   `GetMessage` loop, no timer. Win32 through source-generated P/Invoke (`Shell_NotifyIconW` with
+   `NOTIFYICON_VERSION_4`, `TrackPopupMenuEx`, `CreateIconIndirect`), NativeAOT-safe, no WinForms or WPF. On by default
+   (`tray`), only in an interactive session; `--no-tray` turns it off. Measured once (NativeAOT, idle, no station):
+   private bytes 5.5 MB with the icon against 4.4 MB without, 10 threads against 5.
+2. The service pushes a snapshot after each poll and each page or tray choice: charge, the last fresh reading's input,
+   watts, mode (the flag's mode and the page choice), time left on battery, the confirmed cut. A reading older than
+   `maxGapSec` is stale: grey icon, the tooltip names its time and shows no watts or time left.
+3. The icon is drawn at run time from a 32-bit pixel buffer at the taskbar's size for the system DPI (the tray thread
+   is per-monitor DPI aware): a dark tile, the rounded charge in a 3x5 pixel font, a bar filled to the charge, green
+   on mains, amber on battery, grey unknown. It is rebuilt only when the digits, colour, staleness or size change; the
+   tooltip only when its text changes.
+4. The menu is Auto and the modes as one radio group, "Open panel" (the page through the shell, no window of ours),
+   "Exit tray" (the icon and its notifications go until the next start; the service runs on). The modes come through
+   a small port (list, current, select): under `v2` every mode of `modes.json` in its order, a choice held until Auto
+   as `POST /api/modes/select` holds it; under `legacy` the page's Auto / Eco / Max through the path of
+   `POST /api/mode`. A choice runs off the tray thread.
+5. Explorer's restart (`TaskbarCreated`) adds the icon again; so does a taskbar that was not there yet when the
+   service started at logon.
+6. Notifications are shell balloons (`NIF_INFO`), shown by Windows 10 and 11 as toasts with no app registration or
+   AUMID, respecting quiet time. A WinRT toast would need a Start-menu shortcut with an AUMID for an unpackaged exe
+   and the WinRT notification projection in the NativeAOT image. Without the icon there is nowhere to show them.
+7. Sources: each stored event (a hook on the store, so every writer's events count) by kind: `eco-on`, `mains-back`,
+   `mode-changed`, `mode-dropped` (mode changes); `emergency-on`, `stop`, `hibernate-warning` (low battery);
+   `action-failed`, `mode-refused`, `broker-stale` (failures); `grid-voltage-high` (faults). Mains lost and back follow
+   the confirmed cut between two snapshots, never the first one after a start. Station faults, warnings and
+   over-temperature (V2 stations, §3) come as the whole active list after each poll (`TrayController.ReportAlarms`,
+   fed from the station's own codes and its temperature against `stationTempHighC`): an alarm notifies when it
+   appears, not while it stays.
+8. Each group is switched in `notifications.json`, read at start and on each `PUT /api/settings/notifications`
+   (all or nothing, written as a temp file moved over the old one); a change applies to the next notification.

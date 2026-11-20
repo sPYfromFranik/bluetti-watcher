@@ -80,6 +80,8 @@ Every key with its default, except `mac`, `actions` and the DTEK address, which 
   "staleLoadW": 100,
   "staleAfterMin": 30,
   "cloudHistory": null,
+  "cloudHistoryMaxAgeMin": 10,
+  "cloudLiveMaxAgeSec": 120,
 
   "port": 18940,
   "lockWaitSec": 30,
@@ -173,6 +175,8 @@ config.json still loads, and `service.log` names them once at start.
 | `actionTimeoutSec` | int | 30 | 1-600: time limit of each action (only actions). |
 | `actions` | object | none | Commands run when the service enters a state: keys `eco`, `emergency`, `stop`, `hibernate-warn`, `normal`; and the alert `grid-voltage-high` (grid input above 253 V, again after it was under 250 V); V2 stations also `station-warning`, `station-fault`, `station-alarm-cleared` and `station-hot`. See below. |
 | `dryRun` | bool | false | Log every power-mode command, action and hibernation instead of running it (also `--dry-run`). |
+| `modes.engine` | string | `v2` | `v2`: user-defined power modes with Auto rules, set on the page or through the API ([design.md](design.md) §12, [api.md](api.md) Power modes); their settings live in `modes.json` in the data directory, not here. `legacy`: the fixed eco above and the page's Auto / Eco / Max. Any other value = `legacy`, named in the log. |
+| `modes.commands` | object | `{}` | Named commands a mode's "Run a command on enter and on leave" action (`command.pair`) may run: `{ "<name>": { "exe": "<path>", "args": ["..."], "timeoutSec": 30 } }`. Only this file defines them; a mode, the page and the API pick a name, never an executable or an argument. Each run is windowless, with no shell, killed at `timeoutSec` (1-600); a non-zero exit is a failed action. See below. |
 
 An action is an executable followed by its arguments, started directly with no shell: a pipe, a redirect or a shell
 built-in needs `cmd /c ...`. It runs windowless, with the environment values `POWER_MODE_FILE`, `POWER_MODE_MUTEX`,
@@ -184,7 +188,28 @@ Auto-lift fire `normal`. A dry run logs the actions and their environment instea
 A flag path set while `powerMode.mutex` is left at its default is reported at start (log and event `config-warning`):
 set both, or neither.
 
-Hibernation off: create an empty file `no-hibernate` in the data directory. It is read on every poll.
+Under `modes.engine` = `v2` (the default) the station's eco and mains-back run no power-mode command and no
+`actions.eco` / `actions.normal` line: at the first v2 start those two lines become the commands `eco` and `normal`
+(split into the executable and its arguments by the Windows rules, the same arguments the program received before;
+a name already in `modes.commands` wins) and the built-in Eco's command pair runs `eco` on entering Eco and `normal`
+on leaving it. The other `actions` keys fire as before. A pair entered before a restart still runs its leave command
+when the mode is left: the modes journal, not the process's memory, says it was entered.
+
+```json
+"modes": {
+  "commands": {
+    "backup-pause":  { "exe": "C:\\Program Files\\Backup\\backup.exe", "args": ["pause"],  "timeoutSec": 30 },
+    "backup-resume": { "exe": "C:\\Program Files\\Backup\\backup.exe", "args": ["resume"], "timeoutSec": 30 }
+  }
+}
+```
+
+The built-in Eco lists its optional actions off and empty: a command pair (a backup pause), services to stop (Windows
+Search, Xbox gaming services, Windows Health, ... - the admin broker runs the stop and the start), Phone Link closed,
+and the GPU idle watcher, which logs what holds the GPU at full clock. Turn them on and fill them in on the page.
+
+Hibernation off: create an empty file `no-hibernate` in the data directory. It is read on every poll. With
+`modes.engine` = `v2`, `PUT /api/settings/hibernate` turns it off too; the file is still honoured.
 
 ## Wake during a cut
 
@@ -204,7 +229,9 @@ Hibernation off: create an empty file `no-hibernate` in the data directory. It i
 | `cloudTokenPath` | string or null | null | The token file; null = `cloud-token.json` in the data directory. The page's "Sign in to BLUETTI cloud" and `BluettiWatcher.exe --cloud-login` write it; the page's "Sign out" deletes it. |
 | `staleLoadW` | number | 100 | A cloud reading off mains with at least this AC load whose SOC has not moved for `staleAfterMin` is stale (a miss). |
 | `staleAfterMin` | int | 30 | Minutes for the stale check; 0 or less = no check. |
-| `cloudHistory` | bool or null | null | Gaps in the history filled from the cloud's 5-minute power curve ([design.md §4a](design.md#4a-cloud-history-back-fill)): null or `true` = on while the reading source allows the cloud (`auto` with the cloud fallback on, or `cloud`) and the token file exists; `false` off. |
+| `cloudHistory` | bool or null | null | Gaps in the history filled from the cloud's 5-minute power curve ([design.md §4a](design.md#4a-cloud-history-back-fill)): null or `true` = on while the reading source allows the cloud (`auto` with the cloud fallback on, or `cloud`) and the token file exists; `false` off (also off for the live use below). |
+| `cloudHistoryMaxAgeMin` | int | 10 | When the cloud's live state is no reading (every field null, no SOC, too old or all zero), the history's newest point is the reading while it is at most this many minutes old (design.md §4 AC2b); older is a miss; 0 or less = never. |
+| `cloudLiveMaxAgeSec` | int | 120 | The cloud's live state (getDeviceLastAlive) is a reading while its timestamp, the station's local time read in this PC's time zone, is at most this many seconds off the clock either way (design.md §4 AC2); otherwise the history stand-in above is asked; 0 or less = never a live reading. |
 
 ## Service
 
@@ -214,7 +241,23 @@ Hibernation off: create an empty file `no-hibernate` in the data directory. It i
 | `lockWaitSec` | int | 30 | 0-600: a start waits this long for an older instance to release the port's lock. |
 | `dataDir` | string | `%LOCALAPPDATA%\bluetti-watcher` | Database, log, config and kill switch (also `--data-dir`). |
 | `rawRetentionDays` | int | 30 | Raw minute rows kept this long, then folded into 5-minute aggregates. |
+| `tray` | bool | true | The notification-area icon and the Windows notifications ([design.md](design.md) §12); `false` or `--no-tray` = neither. Shown only in an interactive session. Which notifications show lives in `notifications.json` (below). |
 | `trimWorkingSet` | bool | true | After each poll the process's pages leave its working set, so the Task Manager "Memory" column (private working set) drops under 1 MB after each poll (an open page raises it again until the next one). Cosmetic: commit (private bytes) does not change, and the pages fault back in at the next poll (from RAM while Windows keeps them on its standby list). `false` keeps them. |
+
+## Notifications (`notifications.json`)
+
+A file of its own in the data directory, written by the service when a switch changes (`PUT /api/settings/notifications`,
+[api.md](api.md)); every group is on while the file is missing. An unreadable file is named in `service.log` and every
+group stays on until the next change rewrites it.
+
+| Key | Default | Notifications |
+|---|---|---|
+| `mains` | true | Mains lost, mains back (the confirmed cut, not a single reading). |
+| `modeChanges` | true | Eco switched on by the service, modes lifted when mains is back, a power mode the Auto rules or a choice put in force (`v2`), a page choice dropped. |
+| `lowBattery` | true | Battery emergency, stop, the hibernate warning. |
+| `failures` | true | A power-mode command or action that failed, a mode choice refused, an admin broker older than the service. |
+| `faults` | true | Station faults and warnings, the grid voltage alert. |
+| `overTemperature` | true | The station's hottest temperature is above `stationTempHighC` (V2 stations). |
 
 ## DTEK module (`dtekWatcher`)
 
@@ -235,7 +278,7 @@ Off by default; it makes no request while off. `null` = off.
 ## Command line
 
 `BluettiWatcher.exe [--config <file>] [--data-dir <dir>] [--port <n>] [--flag <file>] [--power-mode <power-mode.ps1>]
-[--dry-run]` - flags override config.json. `--flag` sets `powerMode.flagPath`,
+[--dry-run] [--no-tray]` - flags override config.json; `--no-tray` sets `tray` to false. `--flag` sets `powerMode.flagPath`,
 `--power-mode` sets `powerMode.script`.
 
 `BluettiWatcher.exe --cloud-login [--data-dir <dir>]` - signs in to the BLUETTI cloud in the browser and writes the

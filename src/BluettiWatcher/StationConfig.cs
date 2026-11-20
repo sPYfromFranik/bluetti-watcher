@@ -91,6 +91,8 @@ internal sealed class StationConfig
     /// commit is unchanged and the pages fault back in at the next poll. false = keep them.
     /// </summary>
     public bool TrimWorkingSet { get; set; } = true;
+    /// <summary>The notification-area icon and the Windows notifications (README, Tray); false or <c>--no-tray</c> = none.</summary>
+    public bool Tray { get; set; } = true;
 
     /// <summary>
     /// A hibernation during a cut arms the wake task this many minutes ahead (10 to 1440); 0 = off, the default until the
@@ -138,6 +140,16 @@ internal sealed class StationConfig
     public int StaleAfterMin { get; set; } = 30;
     /// <summary>Gaps in the history filled from the cloud's own 5-minute history (design.md §4a): not set = on with the cloud fallback; false = off.</summary>
     public bool? CloudHistory { get; set; }
+    /// <summary>
+    /// When the device list holds no live state (all zero), the cloud history's newest point is the reading while it is at
+    /// most this many minutes old (design.md §4 AC2b); 0 or less = never.
+    /// </summary>
+    public int CloudHistoryMaxAgeMin { get; set; } = 10;
+    /// <summary>
+    /// The cloud's live state (getDeviceLastAlive) is a reading while its timestamp is at most this many seconds off the
+    /// clock (design.md §4 AC2); older, or 0 or less, = no live state, so the history stand-in (AC2b) is asked.
+    /// </summary>
+    public int CloudLiveMaxAgeSec { get; set; } = 120;
 
     public const string DefaultMutex = "Local\\BluettiWatcherPowerMode";
     public const string DefaultTaskPrefix = "BluettiWatcherEco";
@@ -279,6 +291,9 @@ internal sealed class StationConfig
     [JsonIgnore]
     public bool CloudHistoryOn => CloudHistory != false && CloudOn && File.Exists(CloudTokenFile);
 
+    /// <summary>The power modes engine (design.md, Power modes): <c>modes.engine</c> = legacy (default) or v2.</summary>
+    public BluettiWatcher.Modes.ModesConfig Modes { get; set => field = value ?? new(); } = new();
+
     /// <summary>The DTEK Watcher module (design.md §11 DTEK module); off until an address is given.</summary>
     public DtekConfig DtekWatcher { get; set => field = value ?? new DtekConfig(); } = new();
 
@@ -301,10 +316,11 @@ internal sealed class StationConfig
         if (flags.TryGetValue("flag", out var flag)) cfg.PowerMode.FlagPath = flag;
         if (flags.TryGetValue("power-mode", out var pm)) cfg.PowerMode.Script = pm;
         if (flags.ContainsKey("dry-run")) cfg.DryRun = true;
+        if (flags.ContainsKey("no-tray")) cfg.Tray = false;
         return cfg;
     }
 
-    private static readonly HashSet<string> SwitchFlags = new(["dry-run", "cloud-login", "version", "help"], StringComparer.OrdinalIgnoreCase);
+    private static readonly HashSet<string> SwitchFlags = new(["dry-run", "no-tray", "cloud-login", "version", "help"], StringComparer.OrdinalIgnoreCase);
     private static readonly HashSet<string> ValueFlags = new(["config", "data-dir", "port", "reader", "flag", "power-mode"], StringComparer.OrdinalIgnoreCase);
 
     /// <summary>Flags to values; a switch maps to "1". An unknown flag, a stray word or a value that is itself a flag is refused.</summary>
@@ -329,6 +345,7 @@ internal sealed class StationConfig
 [JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase, WriteIndented = false, ReadCommentHandling = JsonCommentHandling.Skip, UseStringEnumConverter = true)]
 [JsonSerializable(typeof(StationConfig))]
 [JsonSerializable(typeof(PowerModeConfig))]
+[JsonSerializable(typeof(BluettiWatcher.Modes.ModesConfig))]
 [JsonSerializable(typeof(StationState))]
 [JsonSerializable(typeof(DtekSnapshot))]
 [JsonSerializable(typeof(List<DtekLate>))]
