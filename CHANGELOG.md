@@ -6,6 +6,14 @@ The release notes on GitHub are this file's section for the tag.
 
 ## [Unreleased]
 
+### Changed
+
+- Notifications stay in the Windows notification centre after their banner is gone: they are Windows toasts under the
+  app id `BluettiWatcher`, which `install.ps1` now sets on the Start-menu shortcut "Bluetti Watcher". A click opens the
+  page. Without that shortcut (a run without the installer, or an install before this version until `install.ps1`
+  runs again) they stay tray balloons, which Windows keeps nowhere; the log says which (`tray: notices are ...`).
+  The exe grows by 29 KB.
+
 ## [1.10.0] - 2026-11-20
 
 ### Added
