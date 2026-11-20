@@ -17,6 +17,15 @@ The release notes on GitHub are this file's section for the tag.
   `the connection did not open within 12 s (hung in: GATT services (connecting))`: a station Windows never connected
   to is told from a GATT setup that stalled after the connection.
 
+### Fixed
+
+- A modes write (`PUT /api/modes/{id}` and every other modes change) answers within its 5 s wait again (202, pending)
+  when an action or a module's check blocks its thread: a refresh-rate change blocks while the screens resync, and the
+  change ran on the request's own thread, so the 5 s wait never started and the connection was dropped at the server's
+  10 s limit. The change now starts on the thread pool, never on its caller's thread.
+- The refresh-rate action's form says that a refresh-rate change can crash a browser's GPU process, which then renders
+  in software until the browser restarts.
+
 ## [1.10.0] - 2026-11-20
 
 ### Added
