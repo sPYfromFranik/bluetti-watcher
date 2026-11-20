@@ -1,11 +1,12 @@
 using System.Globalization;
 using BluettiWatcher.Decision;
 using BluettiWatcher.Io;
+using BluettiWatcher.Runtime;
 using BluettiWatcher.Storage;
 
 namespace BluettiWatcher;
 
-internal sealed record ModeChange(bool Ok, int Status, string Message, ManualMode Manual);
+internal sealed record ModeChange(bool Ok, int Status, string Message, ManualMode Manual, ManualMode? Pending);
 
 /// <summary>
 /// One poll: a reading, a stored row, the decision, its actions. The state is saved before anything is switched; an
@@ -27,6 +28,7 @@ internal sealed class StationService(StationConfig config, IStationReader reader
     private BatteryWritten? _battery;
     private Reading? _last;
     private DateTimeOffset? _lastAt;
+    private double? _drain;
     private DateTimeOffset? _lastPollAt;
     private PowerModeFlag? _flag;
     private readonly Lock _settledGate = new();
@@ -65,7 +67,7 @@ internal sealed class StationService(StationConfig config, IStationReader reader
     /// <summary>The settle signal after a change of the page choice. Always called under the gate: it reads the state.</summary>
     private void Signal()
     {
-        bool waiting = _state.ModePending is not null && _state.ModeError.Length == 0;
+        bool waiting = (_state.ModePending is not null && _state.ModeError.Length == 0) || Volatile.Read(ref _autoAwaitsReading);
         lock (_settledGate)
         {
             if (!waiting) _settled.TrySetResult();
@@ -124,22 +126,64 @@ internal sealed class StationService(StationConfig config, IStationReader reader
         store.SaveState(_state);
     }
 
+    /// <summary>
+    /// The measured drain at this reading (battery points per hour) the levels follow; null on mains, with too little or
+    /// stale data, or when the history cannot be read (the configured levels apply).
+    /// </summary>
+    private double? Drain(Reading? reading, DateTimeOffset now)
+    {
+        if (reading is null || config.RateWindowMin <= 0) return null;
+        long nowSec = now.ToUnixTimeSeconds();
+        try { return RuntimeEstimator.DrainPerHour(reading, store.History(nowSec - config.RateWindowMin * 60L, nowSec + 1, 1), nowSec, config); }
+        catch (Exception e) when (e is System.Data.Common.DbException or InvalidOperationException)
+        {
+            log($"drain: history read failed - {e.GetType().Name}: {e.Message}; the configured levels apply");
+            return null;
+        }
+    }
+
+    /// <summary>The levels of the last accepted reading: the configured ones raised by its measured drain.</summary>
+    public Thresholds Thresholds => StationDecision.Effective(config, _drain);
+
+    /// <summary>The station's codes active and its over-temperature state; in memory, so a code still set after a restart is said once more.</summary>
+    private IReadOnlySet<string> _stationCodes = new HashSet<string>(StringComparer.Ordinal);
+    private bool _stationHot;
+
+    /// <summary>The station's own warnings, faults and temperature (V2 stations): an event row and the config's action per change.</summary>
+    private void StationAlarmEvents(StationExtras? extras, DateTimeOffset now)
+    {
+        var (codes, hot, events) = StationAlarms.Step(_stationCodes, _stationHot, extras, config.StationTempHighC);
+        _stationCodes = codes;
+        _stationHot = hot;
+        foreach (var e in events)
+        {
+            store.AddEvent(now, e.Kind, e.Detail);
+            log(e.Detail);
+            onState?.Fire(e.Kind);
+        }
+    }
+
     /// <summary>One poll. Returns the delay in seconds before the next one.</summary>
     public async Task<int> PollAsync(CancellationToken ct)
     {
         var reading = await reader.ReadAsync(ct);
         var now = time.GetLocalNow();   // the reading's time: when it arrived, before any lock
         await _gate.WaitAsync(ct);
+        long heldSince = time.GetTimestamp();
         try
         {
             _lastPollAt = now;
-            _flag = flagReader.Read(now);
+            // This decision applies whatever Auto the page asked a reading for: the request is spent.
+            Volatile.Write(ref _autoAwaitsReading, false);
+            Volatile.Write(ref _pollWanted, false);
+            _flag = await flagReader.ReadOffPoolAsync(now);
             Interlocked.Increment(ref _planEpoch);
-            var d = StationDecision.Decide(reading, _state, _flag?.View ?? FlagView.Unreadable, now, config);
+            double? drain = Drain(reading, now);
+            var d = StationDecision.Decide(reading, _state, _flag?.View ?? FlagView.Unreadable, now, config, drain);
             var status = reading is null ? ReadingStatus.Missed : d.Rejected.Length > 0 ? ReadingStatus.Rejected : ReadingStatus.Accepted;
             store.AddReading(now, reading, status, d.Rejected);
             string? sourceBefore = _last?.Source;
-            if (status == ReadingStatus.Accepted) { _last = reading; _lastAt = now; }
+            if (status == ReadingStatus.Accepted) { _last = reading; _lastAt = now; _drain = drain; }
             bool cutBefore = _state.Cut || _state.CutBeforeGap;
             bool silentBefore = _state.Silent;
             // Taken from the state before the decision: a gap that resets the decision's state does not re-fire the alert.
@@ -167,6 +211,7 @@ internal sealed class StationService(StationConfig config, IStationReader reader
                 onState?.Fire(StateActions.GridHigh);
             }
             else if (gridRearmed) log($"grid input {Fmt(reading!.GridVolt!.Value)} V, under {Fmt(GridVoltageAlarm.RearmBelow)} V: the high-voltage alert re-armed");
+            if (status == ReadingStatus.Accepted) StationAlarmEvents(reading!.Extras, now);
 
             foreach (var a in d.Actions)
             {
@@ -233,7 +278,11 @@ internal sealed class StationService(StationConfig config, IStationReader reader
                 && _backoff.Open("hibernate", now)) await RehibernateAsync(step, ct);
             return d.DelaySec;
         }
-        finally { _gate.Release(); }
+        finally
+        {
+            Signal();
+            ReleaseGate(heldSince, "the poll");
+        }
     }
 
     /// <summary>
@@ -355,22 +404,36 @@ internal sealed class StationService(StationConfig config, IStationReader reader
             // The battery levels apply always: Max overrides eco only, never a station emergency.
             // Eco is refused here too (power-mode.ps1 refuses it under an emergency): an accepted press would show Eco on the
             // page until the loop dropped it, with the refusal seen only a poll later.
-            if (mode is ManualMode.Max or ManualMode.Eco && EmergencyHolds(flagReader.Read(now)))
+            if (mode is ManualMode.Max or ManualMode.Eco && EmergencyHolds(await flagReader.ReadOffPoolAsync(now)))
             {
                 string held = mode == ManualMode.Max ? MaxHeldBack : EcoHeldBack;
                 store.AddEvent(now, "mode-refused", held);
-                return new ModeChange(false, 409, held, _state.Manual);
+                return new ModeChange(false, 409, held, _state.Manual, _state.ModePending);
             }
             bool liftEco = mode == ManualMode.Auto && _state.Manual == ManualMode.Eco && !_state.Cut;
+            var before = _state.Manual;
+            var waiting = _state.ModePending;
             _state = StationDecision.SetManual(_state, mode, now);
             _state.ModePending = mode != ManualMode.Auto || liftEco ? mode : null;
             _state.ModeError = "";
             store.SaveState(_state);
-            store.AddEvent(now, "mode", mode.ToString().ToLowerInvariant());
+            store.AddEvent(now, "mode", Lower(mode));
+            // The latest press wins, never silently: the one it replaces before its command ran is on record.
+            if (waiting is { } replaced && replaced != _state.ModePending)
+            {
+                string text = $"{Lower(replaced)} replaced by {Lower(mode)} before it ran";
+                store.AddEvent(now, "mode-superseded", text);
+                log($"mode: {text}");
+            }
+            // Auto after a pinned Max or Eco runs no command of its own: the battery rules decide, so the loop reads the
+            // station now instead of at its minute. With nothing to poll (PollProblem) no reading comes, so none is awaited.
+            bool autoAfterPin = mode == ManualMode.Auto && before != ManualMode.Auto && config.PollProblem is null;
+            Volatile.Write(ref _autoAwaitsReading, autoAfterPin);
+            if (autoAfterPin) Volatile.Write(ref _pollWanted, true);
             Signal();
             _wake.Release();
             _press.Release();
-            return new ModeChange(true, 202, "accepted", _state.Manual);
+            return new ModeChange(true, 202, "accepted", _state.Manual, _state.ModePending);
         }
         finally { _gate.Release(); }
     }
@@ -379,13 +442,14 @@ internal sealed class StationService(StationConfig config, IStationReader reader
     public async Task ApplyPendingAsync(CancellationToken ct)
     {
         await _gate.WaitAsync(ct);
+        long heldSince = time.GetTimestamp();
         try
         {
             if (_state.ModePending is not { } mode) return;
             var now = time.GetLocalNow();
             // Every attempt, retries included, re-checks the hold: no page choice ever lifts a station emergency, and the
             // page's Eco, which power-mode.ps1 refuses under an emergency, is dropped the same way instead of retried.
-            var flag = flagReader.Read(now);
+            var flag = await flagReader.ReadOffPoolAsync(now);
             if (EmergencyHolds(flag))
             {
                 if (_state.Manual == mode && mode != ManualMode.Auto) _state = StationDecision.SetManual(_state, ManualMode.Auto, now);
@@ -413,18 +477,32 @@ internal sealed class StationService(StationConfig config, IStationReader reader
             if (r is null) { BackingOff(mode, key); return; }
             if (!r.Ok && !r.DryRun) { _modeFailure[key] = r.LastLine; _state.ModeError = $"{mode}: {r.LastLine}"; store.SaveState(_state); return; }
             _modeFailure.Remove(key);
+            // The page shows the flag the command wrote now, not the poll's of up to a minute ago.
+            _flag = await flagReader.ReadOffPoolAsync(time.GetLocalNow());
             Interlocked.Increment(ref _planEpoch);   // the plan may have changed
             if (r.Ok) onState?.Enter(mode == ManualMode.Eco ? StateActions.Eco : StateActions.Normal);
             _state.ModePending = null;
             _state.ModeError = "";
             store.SaveState(_state);
-            store.AddEvent(now, "mode-applied", mode.ToString().ToLowerInvariant() + (r.DryRun ? " (dry run)" : ""));
+            store.AddEvent(now, "mode-applied", Lower(mode) + (r.DryRun ? " (dry run)" : ""));
         }
         finally
         {
             Signal();
-            _gate.Release();
+            ReleaseGate(heldSince, "the mode change");
         }
+    }
+
+    private static string Lower(ManualMode mode) => mode.ToString().ToLowerInvariant();
+
+    /// <summary>A poll or a mode change holding the gate past this is logged: a stall is seen in service.log, not guessed.</summary>
+    internal static readonly TimeSpan SlowGate = TimeSpan.FromSeconds(20);
+
+    private void ReleaseGate(long heldSince, string holder)
+    {
+        var held = time.GetElapsedTime(heldSince);
+        _gate.Release();
+        if (held > SlowGate) log($"slow: {holder} held the station gate for {((int)held.TotalSeconds).ToString(CultureInfo.InvariantCulture)} s");
     }
 
     /// <summary>
@@ -463,6 +541,15 @@ internal sealed class StationService(StationConfig config, IStationReader reader
     {
         if (wait > TimeSpan.Zero) await _wake.WaitAsync(wait, ct);
     }
+
+    private bool _pollWanted;
+    private bool _autoAwaitsReading;
+
+    /// <summary>true once after an Auto that waits for the battery rules: the loop polls now instead of at its minute.</summary>
+    public bool TakePollRequest() => Interlocked.Exchange(ref _pollWanted, false);
+
+    /// <summary>Auto was pressed after a pinned Max or Eco and no poll has decided since.</summary>
+    public bool AutoAwaitsReading => Volatile.Read(ref _autoAwaitsReading);
 
     /// <summary>The last failure of a page choice's command, "" when none.</summary>
     public string ModeError => _state.ModeError;

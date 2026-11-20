@@ -24,6 +24,12 @@ internal static class PageCodes
     public const string ModeDropped = "mode-dropped";
     public const string ModeFailed = "mode-failed";
     public const string ModeOther = "mode-other";
+    // modeHold: what holds the mode under the buttons, and until when
+    public const string MaxPinnedCut = "max-pinned-cut";
+    public const string MaxPinnedMains = "max-pinned-mains";
+    public const string EcoPinnedCut = "eco-pinned-cut";
+    public const string EcoPinnedMains = "eco-pinned-mains";
+    public const string AutoNext = "auto-next";
     // the eco chip
     public const string EcoEmergency = "eco-emergency";
     public const string EcoEmergencyOver = "eco-emergency-over";
@@ -48,14 +54,18 @@ internal static class PageCodes
     public static IReadOnlyList<string> Notes { get; } =
     [
         StationSilent, HibernateHeld, MaxHeld, ReadingRejected, WakeDisarmFailed, EcoHeld, AutoHeld, FlagUnreadable, ModeDroppedBack, ModeDroppedLost, ModeDropped,
-        ModeFailed, ModeOther, EcoEmergency, EcoEmergencyOver, EcoMains, EcoUntil, DtekQueuesUnknown, DtekNoSchedule, DtekStale, DtekQueueNotFixed,
+        ModeFailed, ModeOther, MaxPinnedCut, MaxPinnedMains, EcoPinnedCut, EcoPinnedMains, AutoNext, EcoEmergency, EcoEmergencyOver, EcoMains, EcoUntil, DtekQueuesUnknown, DtekNoSchedule, DtekStale, DtekQueueNotFixed,
         DtekGroupRefuted, DtekGroupNotHouse, DtekUpdateUnreadable, DtekDatasetFailed, DtekSiteBlocked, DtekSiteFailed, DtekConfig, DtekNotStarted,
         DtekModuleError,
     ];
 
-    /// <summary>Codes sent as values: DTEK states and sources, source states, read error classes, the page's modes, "battery lasts".</summary>
+    /// <summary>
+    /// Codes sent as values: DTEK states and sources, source states, read error classes, the page's modes, "battery lasts",
+    /// the reading sources, the cloud's states and the sign-in's (GET /api/cloud).
+    /// </summary>
     public static IReadOnlyList<string> Values { get; } =
-        ["off", "ok", "stale", "none", "blocked", "failed", "network", "format", "dataset", "site", "auto", "eco", "max", "yes", "no", "unknown"];
+        ["off", "ok", "stale", "none", "blocked", "failed", "network", "format", "dataset", "site", "auto", "eco", "max", "yes", "no", "unknown",
+         "bluetooth", "cloud", "signed-out", "sign-in-needed", "error", "idle", "waiting", "signed-in"];
 
     /// <summary>The station's output modes (bluetti_bt_lib enums/output_mode.py), CLOUD_MAINS (a cloud reading with AC input, design.md §4 AC2a) and BLE_MAINS (the same from a Bluetooth model with no output-mode field).</summary>
     public static IReadOnlyList<string> OutputModes { get; } = ["STOP", "INVERTER_OUTPUT", "BYPASS_OUTPUT_C", "BYPASS_OUTPUT_D", "LOAD_MATCHING", "CLOUD_MAINS", "BLE_MAINS"];

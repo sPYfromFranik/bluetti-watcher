@@ -26,14 +26,31 @@ read-only features to come, are mapped in [bluetti-protocol.md](bluetti-protocol
 1. A per-user background process, no window and no tray, started at logon by a scheduled task as the user (Medium
    integrity, "run only when the user is logged on"), restarted on failure; nothing before logon. It must never run in
    session 0: the power-mode mutex is a `Local\` name shared with the user's own scripts. A start in session 0 exits 2.
-2. Host: one C# NativeAOT exe (`BluettiWatcher.exe`). Bluetooth LE goes in-process through WinRT GATT, the 29 IoT V1 and
+2. Host: one C# NativeAOT exe (`BluettiWatcher.exe`), a console program: a terminal waits for `--help`, `--version` or
+   `power-mode status` and gets its exit code. The scheduled tasks (the logon task, the eco end task) start its twin
+   `BluettiWatcherService.exe`, the same file with the PE subsystem set to Windows GUI, which install.ps1 writes beside
+   it: a task that starts a console program opens a console window, a GUI-subsystem exe opens none. Bluetooth LE goes in-process through WinRT GATT, the 29 IoT V1 and
    V2 models (AC200L, AC200M, AC200PL, AC300, AC500, EB3A, EP500, EP500P; AC2A, AC2P, AC50B, AC60, AC60P, AC70, AC70P,
    AC180, AC180T, AC180P, AP300, EL10, EL30V2, EL100V2, EP600, EP760, EP800, EP2000, Handsfree 1, PR30V2, PR100V2):
    connect, read, disconnect per poll, so the phone
    app can connect between reads; the reading fields in batched function-0x03 reads (notifications on ff01, requests
    on ff02), each answer reassembled to its full length and CRC-checked. The AC200PL's read of 70-80 also carries the
    grid input: register 77 voltage and 80 frequency, both / 10 (as the official app reads them, not in the library);
-   no other request follows the reading. An answer that timed out or came back invalid
+   no other request follows the reading on a V1 station. A V2 station is asked four optional blocks after its reading
+   (`V2Extras`, docs/bluetti-protocol.md sections 2.3, 2.4 and 3): pack voltage and current (100-101), its own time to
+   full and to empty (104-105, minutes likely, not confirmed), warnings and faults (122-138, decoded into the app's codes:
+   prefix E, or B for a high-power inverter, warnings from 113 or 97, faults from 1) and temperatures (1151-1153,
+   u16 - 40 °C). An extra never opens a connection and is never asked again in the poll; an exception reply marks its block "not supported" at once,
+   a short or garbled answer or no answer in two polls in a row does too (one lost answer may be the radio); the mark
+   holds until the service restarts (logged once,
+   `/api/health` `stationBlocks`), so it never fails or slows a later poll. A V1 station (the AC200PL) is never asked them:
+   its registers 100-138 carry other data (105-120 are cell voltages). The station's values are stored per reading and
+   shown on the page; the pack current does not feed the runtime estimate (the app reads it unsigned, so it does not say
+   charge from discharge, and no V2 station was available to validate it). A new warning or fault, a code that clears
+   and a temperature above `stationTempHighC` (re-armed 5 °C under it) each write an event row and run the matching
+   `actions` command. When opening the connection fails (GATT Unreachable, no ff01/ff02), the poll opens once more
+   before it gives up; when `readerTimeoutSec` runs out, the fields already read are kept as a partial reading and the log
+   names what the read was waiting for. An answer that timed out or came back invalid
    ends its connection and the next request goes over a new one; as a reconnect may reuse the radio link, an answer
    that an earlier unanswered request (of this poll or an earlier one) could have sent (same byte count, so any
    one-register read) is set aside and the registers are asked again, so a late answer never fills another request; the
@@ -123,10 +140,51 @@ store's upserts need it), named in one `service.log` line with the version found
 When Bluetooth does not answer, the reading may come from the BLUETTI cloud
 (`GET https://gw.bluettipower.com/api/bluiotdata/ha/v2/devices`, the API of BLUETTI's official Home Assistant
 integration) with the token in `cloud-token.json` (`cloudTokenPath`, default the data directory). It is opt-in:
-`cloudEnabled` not set = on when the token file exists at start; `true` = on; `false` = off.
+`cloudEnabled` not set = on when the token file exists (checked at each poll); `true` = on; `false` = off.
+
+### Reading source
+
+`readingSource` picks where readings come from; the page's Reading source buttons set the same choice:
+
+- `auto` (the default): Bluetooth first, the cloud when Bluetooth misses, as above (`cloudEnabled` applies).
+- `bluetooth`: Bluetooth only. The cloud is never called, no token is needed, and the cloud history (§4a) does not run.
+- `cloud`: the cloud only. Bluetooth is never opened, so no `mac` is needed and any model the cloud lists is read.
+
+Not set = `auto`, or `bluetooth` when `cloudEnabled` is `false` (the key that switched the cloud off before
+`readingSource` existed). The page's choice is saved in `reading-source.json` in the data directory and wins over the
+key from the next poll on, no restart. The page says when the source was set there and offers "Use config", which
+deletes that file so the key applies again. The source in force is read at each
+poll, by the reader and by the history back-fill alike.
+
+### Cloud sign-in
 
 `BluettiWatcher.exe --cloud-login` signs in once: it opens BLUETTI's OAuth login in the browser, catches the answer on
 a localhost address, writes the token file and exits. It never prints the token.
+
+The page's "Sign in to BLUETTI cloud" runs the same authorization-code flow inside the running service
+(`POST /api/cloud/sign-in`): the service starts a one-shot catcher on `127.0.0.1` at a port the OS assigns (never the
+dashboard's), answers the authorize address, and the page opens it in a new tab. The catcher accepts only the `state`
+it issued; it waits 5 minutes. The token is written under the cloud reader's lock, so no read in flight writes an
+older refreshed pair over it, and what the reader held for the old token (a refusal, an unsaved pair) is dropped.
+A second press while one sign-in waits gets the same address. "Sign out" (`POST /api/cloud/sign-out`) stops a waiting
+sign-in and deletes the token file. Both routes sit behind the write guard of `/api/mode`; no answer and no log line
+carries a token, and the authorize address (its one-time `state`) goes only to the page.
+
+### Cloud state
+
+The page and `/api/health` show the cloud's state: `off` (the source never calls the cloud) · `signed-out` (no token
+file) · `ok` (the last read answered, or signed in and not read yet; the detail names the access token's expiry) ·
+`sign-in-needed` (the server refused the refresh token) · `error` (the last read failed; the detail names why).
+
+- AC10: a refresh answered HTTP 400, 401 or 403 is a refused grant, not a hiccup: the state turns `sign-in-needed`, the
+  refused refresh token is not sent again for 6 hours, and while the access token is known dead (it answered 805)
+  no device-list call goes out either: each poll's miss names "sign-in needed" without a request. A new token (the
+  page's sign-in, or `--cloud-login` writing the file) ends the hold at once. Any other failed refresh (429, 5xx, no
+  answer) is retried as before.
+- AC11: under the auto source a healthy Bluetooth never calls the cloud, so a token used only by reads would lapse
+  unnoticed. Once an hour the service checks the token while the source allows the cloud and a token file exists: a
+  pair issued a day ago or more, or expiring within 3 days, is refreshed (logged, never the token). A refused refresh
+  turns the state to `sign-in-needed` (AC10); another failure shows as `error` and waits an hour.
 
 - AC1: when Bluetooth returns a reading, the cloud is not called.
 - AC2: when Bluetooth returns nothing and the cloud returns the station (model starting with `type`, `online` "1",
@@ -135,7 +193,9 @@ a localhost address, writes the token file and exits. It never prints the token.
 - AC2a: the cloud has no output mode, and a reading without one is incomplete (section 3). The mode is derived:
   `GridAllTotalPower` > 0 = `CLOUD_MAINS` (mains is on whatever the mode); `GridAllTotalPower` 0 with `SetCtrlAc` 1
   and `ACLoadAllTotalPower` > 0 = `INVERTER_OUTPUT` (the AC load runs from the battery); anything else = no mode, so
-  the reading is incomplete.
+  the reading is incomplete. The cloud has answered an all-zero device state (SOC 0 %, 0 W in, 0 W out) while the
+  station ran on Bluetooth at a real charge: that answer derives no mode and is rejected as incomplete, which keeps a
+  false 0 % away from the stop and hibernate levels.
 - AC3: when the device is offline (`online` not "1"), the answer is not `msgCode` 0, `SOC` is missing or not a
   number, HTTP fails or times out (15 s cap; a device list request with no answer at all is sent once more), or the
   token file is missing or unreadable, the result is a miss with one log line naming why, never the token.
@@ -222,6 +282,21 @@ fills the gaps of `station.db` from it (`cloudHistory` false = off).
 - The last refusal or failure of a page choice (`modeError`) is saved with the state: a restart keeps it shown until
   the next mode change. `/api/now` carries it in `modeError` only, never repeated in `note`. A gap reset keeps a page
   choice that is still pending.
+- The latest press wins: a press that replaces one whose command has not run yet stores a `mode-superseded` event
+  ("eco replaced by max before it ran") and logs it, so no press vanishes unseen.
+- An applied page choice reads the flag again right after its command: `/api/now` (`powerMode`, the eco chip) shows
+  what the command wrote at once, never the poll's flag of up to a minute ago.
+- What holds the mode is said under the buttons (`modeHold`): Max or Eco pinned until mains returns (in a cut) or goes
+  (on mains), or Auto. Auto after a pinned Max or Eco runs no command of its own: the battery rules decide at the next
+  reading, which the service loop takes at once instead of at its minute (`auto-next` until that reading; the page's
+  settle read waits for it).
+- The power-mode command's `plan:` lines (the plan recorded on eco and the one returned to) are logged with its
+  `warn:` and `note:` lines, the battery call excepted.
+- A stall is visible: a poll or a mode command that holds the station gate for more than 20 s logs
+  `slow: the poll held the station gate for <n> s` (or `the mode change`). The flag reads (under the writers' named
+  mutex, up to 5 s) run on their own thread, never on a thread-pool thread. A tool of the in-process switch that has
+  exited but whose output stays open (a child it left running) is waited for at most 2 s more; then the call stops
+  waiting, tries to stop the tool's tree and uses what it printed.
 - While mains is off and the cut has not begun, `/api/now` gives `ecoAt`: the first-off time plus `mainsLostSec`, when
   the cut begins with eco if mains stays off (eco itself comes with the first accepted reading at or after it). The
   page counts down to it. `ecoAt` is null when no eco is pending: mains on or unknown, the cut already begun, the
@@ -236,6 +311,22 @@ Levels (defaults): `emergencyAt` 20 % -> station emergency (`on`); `stopAt` 10 %
 always, manual Max included. While on battery the reading goes into the flag (`battery`) at each level change and at
 least every `batteryRefreshSec` (600 s); this write is best effort.
 
+- The level after the warning is `warning` (`/api/now`): the warning was given, the PC hibernates at `hibernateAt`.
+  The flag's word for it stays `hibernating` (the hook's `the PC hibernates at N %: save now`). A state saved by an
+  earlier version under the old name `Hibernating` loads as `warning`.
+- Levels raised by the drain. At a high drain the battery can pass the warning and `hibernateAt` within a few polls,
+  and the hibernate, which waits `hibernateAfterWarnSec` after the warning, would come far under `hibernateAt`. So each
+  poll applies the configured levels raised by the measured drain `d` (the measured rate at the current load, section
+  7; `poll` = the larger of `pollSec` and `fastPollSec`): `warnAt` at least `hibernateAt + d x (hibernateAfterWarnSec +
+  2 polls)`, `stopAt` at least the warning plus `d x 2 polls`, `emergencyAt` at least the stop plus `d x 2 polls` (one
+  poll for the ladder's own step, one as the margin; rounded up to a tenth, at most 100). The hibernate then comes at
+  the first poll its own agreement allows at or under `hibernateAt`. `hibernateAt` never moves (the fresh-reading guard
+  and the wake read it), a level never goes under its configured value nor more than 10 points over it (a long
+  `pollSec` or `hibernateAfterWarnSec` would ask for more: the raise stops there), and a low drain leaves them as
+  configured. `d` is capped at 120 %/h (above what a station of this class drains at its rated output). No measured drain (on mains, too little data, the newest stored reading older than
+  `maxGapSec`, a failed history read, a value not finite or not above 0) = the configured levels. A raised level only
+  brings its step earlier: a reading at or under the configured level always counts toward it, so the configured
+  hibernate is never delayed. `/api/now` gives the levels in force as `effectiveThresholds`.
 - Agreement for a level = two accepted readings at least `agreeSec` (90 s) apart with no accepted reading between
   them that contradicts the level. Misses and rejected readings between them neither break nor count toward it; only
   a gap reset does. An accepted reading whose mains state is unknown is not on battery: it breaks every level's
@@ -277,7 +368,8 @@ least every `batteryRefreshSec` (600 s); this write is best effort.
 ## 7. Battery time
 
 The hours of battery shown (`hoursLeft`, to empty; the DTEK module's battery time, to `hibernateAt`) inform only:
-battery levels and hibernate act on SOC thresholds alone and never read the estimate.
+battery levels and hibernate never read the estimate. The levels read one number beside it, the measured rate at the
+current load, and only to rise (section 6).
 
 - Measured rate: the SOC drop over the trailing run of accepted readings off mains within `rateWindowMin` (60). The
   run ends at a reading on mains, a reading without SOC or a gap over `maxGapSec`; the span runs from the run's first

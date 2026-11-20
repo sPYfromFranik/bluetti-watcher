@@ -74,6 +74,7 @@ Every key with its default, except `mac`, `actions` and the DTEK address, which 
   "wakeFloorPercent": null,
   "wakeTaskName": "BluettiWatcherWake",
 
+  "readingSource": null,
   "cloudEnabled": null,
   "cloudTokenPath": null,
   "staleLoadW": 100,
@@ -126,6 +127,7 @@ config.json still loads, and `service.log` names them once at start.
 | `fastPollSec` | int | 60 | Seconds between readings on battery under `fastBelow`. |
 | `fastBelow` | number | 25 | Battery percent under which `fastPollSec` applies. |
 | `readerTimeoutSec` | int | 30 | Time limit of one Bluetooth read (connect, every request, disconnect); a Bluetooth call that does not return is given up 2 s after it. |
+| `stationTempHighC` | int | 60 | V2 stations: a station temperature (registers 1151-1153) above this writes a `station-hot` event and runs its action; re-armed 5 °C under it. |
 | `maxGapSec` | int | 600 | A gap between accepted readings over this resets the decision state. |
 | `socRatePerMin` | number | 5 | Largest plausible SOC change, points per minute. |
 | `socJumpFloor` | number | 3 | The allowed SOC change is never under this many points. |
@@ -140,7 +142,7 @@ config.json still loads, and `service.log` names them once at start.
 | `mainsBackSec` | int | 180 | AC input held this long -> every mode lifted. |
 | `emergencyAt` | number | 20 | Percent: station emergency. |
 | `stopAt` | number | 10 | Percent: stop (the flag's level says critical). |
-| `warnAt` | number | 7 | Percent: hibernate warning. |
+| `warnAt` | number | 7 | Percent: hibernate warning. `emergencyAt`, `stopAt` and `warnAt` rise above the configured value at a high measured drain (design.md section 6). |
 | `hibernateAt` | number | 5 | Percent: the PC hibernates. |
 | `agreeSec` | int | 90 | Two agreeing readings at least this far apart confirm a level. |
 | `hibernateAfterWarnSec` | int | 180 | Hibernate waits at least this long after the warning. |
@@ -169,7 +171,7 @@ config.json still loads, and `service.log` names them once at start.
 | `pwshPath` | string | `pwsh.exe` | PowerShell 7 used to run the wake-task commands and a configured `powerMode.script`. |
 | `powerModeTimeoutSec` | int | 60 | 1-600: time limit of each power-mode command and each wake-task command. A command over it is killed and counts as failed. |
 | `actionTimeoutSec` | int | 30 | 1-600: time limit of each action (only actions). |
-| `actions` | object | none | Commands run when the service enters a state: keys `eco`, `emergency`, `stop`, `hibernate-warn`, `normal`; and the alert `grid-voltage-high` (grid input above 253 V, again after it was under 250 V). See below. |
+| `actions` | object | none | Commands run when the service enters a state: keys `eco`, `emergency`, `stop`, `hibernate-warn`, `normal`; and the alert `grid-voltage-high` (grid input above 253 V, again after it was under 250 V); V2 stations also `station-warning`, `station-fault`, `station-alarm-cleared` and `station-hot`. See below. |
 | `dryRun` | bool | false | Log every power-mode command, action and hibernation instead of running it (also `--dry-run`). |
 
 An action is an executable followed by its arguments, started directly with no shell: a pipe, a redirect or a shell
@@ -197,11 +199,12 @@ Hibernation off: create an empty file `no-hibernate` in the data directory. It i
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `cloudEnabled` | bool or null | null | null = on when the token file exists at start; `true` on; `false` off. |
-| `cloudTokenPath` | string or null | null | The token file; null = `cloud-token.json` in the data directory. `BluettiWatcher.exe --cloud-login` writes it. |
+| `readingSource` | string or null | null | Where readings come from ([design.md §4 Reading source](design.md#reading-source)): `auto` Bluetooth first, the cloud when it misses · `bluetooth` never the cloud (no token, no cloud history) · `cloud` never Bluetooth (no `mac` needed). null = `auto`, or `bluetooth` when `cloudEnabled` is `false`. The page's Reading source buttons save a choice in `reading-source.json` in the data directory that wins over this key without a restart; the page's "Use config" (or deleting that file) returns to the key. While the source allows the cloud, the token is refreshed once a day even when Bluetooth answers. Another value refuses the start. |
+| `cloudEnabled` | bool or null | null | Under the `auto` source: null = on while the token file exists; `true` on; `false` off. |
+| `cloudTokenPath` | string or null | null | The token file; null = `cloud-token.json` in the data directory. The page's "Sign in to BLUETTI cloud" and `BluettiWatcher.exe --cloud-login` write it; the page's "Sign out" deletes it. |
 | `staleLoadW` | number | 100 | A cloud reading off mains with at least this AC load whose SOC has not moved for `staleAfterMin` is stale (a miss). |
 | `staleAfterMin` | int | 30 | Minutes for the stale check; 0 or less = no check. |
-| `cloudHistory` | bool or null | null | Gaps in the history filled from the cloud's 5-minute power curve ([design.md §4a](design.md#4a-cloud-history-back-fill)): null or `true` = on while the cloud fallback is on and the token file exists; `false` off. |
+| `cloudHistory` | bool or null | null | Gaps in the history filled from the cloud's 5-minute power curve ([design.md §4a](design.md#4a-cloud-history-back-fill)): null or `true` = on while the reading source allows the cloud (`auto` with the cloud fallback on, or `cloud`) and the token file exists; `false` off. |
 
 ## Service
 
@@ -236,7 +239,8 @@ Off by default; it makes no request while off. `null` = off.
 `--power-mode` sets `powerMode.script`.
 
 `BluettiWatcher.exe --cloud-login [--data-dir <dir>]` - signs in to the BLUETTI cloud in the browser and writes the
-token file, then exits. An answer without a valid `expires_in` is refused and nothing is written.
+token file, then exits. An answer without a valid `expires_in` is refused and nothing is written. The dashboard's
+"Sign in to BLUETTI cloud" does the same without a terminal, inside the running service.
 
 `BluettiWatcher.exe --help` (`-h`, `/?`) prints the usage and `--version` prints `Bluetti Watcher <version>`; both exit 0
 and win over every other word on the line (`--cloud-login --help` only prints the usage). A flag that takes a value

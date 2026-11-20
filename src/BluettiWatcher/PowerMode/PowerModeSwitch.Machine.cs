@@ -46,7 +46,7 @@ internal sealed partial class PowerModeSwitch
     private static partial Regex ShortNumberPattern();
 
     /// <summary>A child process with no window, killed (whole tree) after <paramref name="timeoutMs"/>: code -2 = timed out.</summary>
-    internal static PmToolResult RunTimed(string file, IEnumerable<string> list, int timeoutMs)
+    internal static PmToolResult RunTimed(string file, IEnumerable<string> list, int timeoutMs, int drainMs = DrainMs)
     {
         string name = Path.GetFileName(file);
         var psi = new ProcessStartInfo(file)
@@ -59,9 +59,12 @@ internal sealed partial class PowerModeSwitch
         };
         var stdout = new List<string>();
         var stderr = new List<string>();
+        // Each stream's end (a null line): signalled from the reader threads, never disposed, so a late end cannot throw.
+        var outEnd = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var errEnd = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         using var p = new Process { StartInfo = psi };
-        p.OutputDataReceived += (_, e) => { if (e.Data is not null) lock (stdout) stdout.Add(e.Data); };
-        p.ErrorDataReceived += (_, e) => { if (e.Data is not null) lock (stderr) stderr.Add(e.Data); };
+        p.OutputDataReceived += (_, e) => { if (e.Data is null) outEnd.TrySetResult(); else lock (stdout) stdout.Add(e.Data); };
+        p.ErrorDataReceived += (_, e) => { if (e.Data is null) errEnd.TrySetResult(); else lock (stderr) stderr.Add(e.Data); };
         try { p.Start(); }
         catch (Exception e) when (e is Win32Exception or InvalidOperationException or IOException) { return new(-1, [$"{name} could not start: {e.Message}"]); }
         p.BeginOutputReadLine();
@@ -73,9 +76,20 @@ internal sealed partial class PowerModeSwitch
             catch (Exception e) when (e is Win32Exception or InvalidOperationException or AggregateException) { Skip(e); }
             return new(-2, [$"{name} timed out after {Num(timeoutMs)} ms (stopped)"]);
         }
-        p.WaitForExit();   // the output events are drained
+        // The output is drained, bounded: a child the tool left running holds the pipes open and an untimed wait never returns.
+        // This method is synchronous by design (the switch runs on its own thread), so the bounded block is the wait itself.
+        if (!Task.WaitAll([outEnd.Task, errEnd.Task], drainMs))
+        {
+            try { p.Kill(entireProcessTree: true); }
+            catch (Exception e) when (e is Win32Exception or InvalidOperationException or AggregateException) { Skip(e); }
+            // The kill closes the pipes: the lines the readers have not delivered yet still come, up to both ends, bounded.
+            _ = Task.WaitAll([outEnd.Task, errEnd.Task], DrainMs);
+        }
         lock (stdout) lock (stderr) return new(p.ExitCode, [.. stdout.Concat(stderr).Where(l => l.Trim().Length > 0)]);
     }
+
+    /// <summary>How long a tool that has exited may keep its output open before the rest of its tree is stopped.</summary>
+    internal const int DrainMs = 2000;
 
     /// <summary>A real System32 tool: under POWER_MODE_TEST=1 the command stops (exit 2) and the tool is never started.</summary>
     private PmToolResult RealTool(string exeName, IEnumerable<string> list)
@@ -370,7 +384,7 @@ internal sealed partial class PowerModeSwitch
         .Replace("&lt;", "<", StringComparison.Ordinal).Replace("&gt;", ">", StringComparison.Ordinal).Replace("&amp;", "&", StringComparison.Ordinal);
 
     /// <summary>
-    /// The eco end task: this exe (a WinExe: no window) with <paramref name="arguments"/>, as the interactive user, least
+    /// The eco end task: <see cref="ExePath"/> (the windowless twin once installed) with <paramref name="arguments"/>, as the interactive user, least
     /// privilege, only while they are logged on - never SYSTEM; a run missed while they were logged off starts at the next logon.
     /// </summary>
     internal static string EndTaskXml(string userSid, string exe, string arguments, DateTimeOffset at) => $"""
@@ -417,6 +431,40 @@ internal sealed partial class PowerModeSwitch
     }
 
     private void RemoveEndTask() => _ = SchTasks("/delete", "/tn", EndTask, "/f");
+
+    /// <summary>
+    /// A pending end task that starts the console BluettiWatcher.exe would open a console window when it fires: pointed at
+    /// <see cref="ExePath"/> when that is the windowless twin, its trigger and arguments kept. Only BluettiWatcher.exe is
+    /// replaced, never another command. Null = nothing to do, else one line for the log.
+    /// </summary>
+    internal string? RepointEndTask()
+    {
+        if (!string.Equals(Path.GetFileName(ExePath), ServiceExeName, StringComparison.OrdinalIgnoreCase)) return null;
+        // The task's name comes from POWER_MODE_TASK_PREFIX, as for every command.
+        try { LoadNames(); }
+        catch (InvalidOperationException e) { return $"eco end task: not checked ({e.Message})"; }
+        var q = SchTasks("/query", "/tn", EndTask, "/xml");
+        if (q.Code != 0) return null;
+        string xml = string.Join('\n', q.Out).TrimStart('﻿');
+        var command = CommandPattern().Match(xml);
+        if (!command.Success) return null;
+        string current = XmlUnescape(command.Groups[1].Value).Trim();
+        if (!string.Equals(Path.GetFileName(current), "BluettiWatcher.exe", StringComparison.OrdinalIgnoreCase)) return null;
+        var value = command.Groups[1];
+        string repointed = string.Concat(xml.AsSpan(0, value.Index), XmlEscape(ExePath), xml.AsSpan(value.Index + value.Length));
+        string xmlFile = Path.Combine(Path.GetTempPath(), $"power-mode-end-task-{Num(Environment.ProcessId)}-{Guid.NewGuid():N}.xml");
+        try
+        {
+            File.WriteAllText(xmlFile, repointed, Encoding.Unicode);
+            var r = SchTasks("/create", "/tn", EndTask, "/xml", xmlFile, "/f");
+            return r.Code == 0 ? $"eco end task {EndTask}: now starts {ExePath} (no console window)" : $"eco end task {EndTask}: still starts {current} ({r.LastLine})";
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return $"eco end task {EndTask}: still starts {current} ({e.Message})"; }
+        finally
+        {
+            if (File.Exists(xmlFile)) File.Delete(xmlFile);
+        }
+    }
 
     private bool EndTaskPresent() => SchTasks("/query", "/tn", EndTask).Code == 0;
 

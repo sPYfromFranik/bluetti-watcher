@@ -37,7 +37,7 @@ public sealed class ModeFeedbackApiTests : IDisposable
         Directory.Delete(_dir, recursive: true);
     }
 
-    private StationApi Api(Func<(string, string)>? plan = null) => new(_cfg, _service, _store, _clock, T0, activePlan: plan);
+    private StationApi Api(Func<(string, string)>? plan = null, StationService? service = null) => new(_cfg, service ?? _service, _store, _clock, T0, activePlan: plan);
 
     private static HttpRequest Req(string method, string path, string? body = null)
     {
@@ -195,6 +195,23 @@ public sealed class ModeFeedbackApiTests : IDisposable
         }
         finally { hold.Set(); }
     }
+    // A request that already spent 9 s of the server's 10 (a slow head, a busy machine) gets what is left, never a
+    // fresh settle window plus the plan wait: it answers at once with the state as it is.
+    [Fact]
+    public async Task Settle_and_plan_waits_are_bounded_by_the_time_left_in_the_request()
+    {
+        using var hold = new ManualResetEventSlim(false);
+        var api = Api(() => { hold.Wait(TimeSpan.FromSeconds(30)); return ("", ""); });
+        try
+        {
+            Assert.Equal(202, (await Press(api, "eco")).Status);
+            var late = Req("GET", "/api/now?settle=1") with { StartedAt = System.Diagnostics.Stopwatch.GetTimestamp() - 9 * System.Diagnostics.Stopwatch.Frequency };
+            var r = await api.HandleAsync(late, TestContext.Current.CancellationToken).WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+            Assert.Equal(200, r.Status);
+        }
+        finally { hold.Set(); }
+    }
+
     /// <summary>A station read that never answers until released, as a Bluetooth read stuck on its timeout.</summary>
     private sealed class HangingReader : IStationReader
     {
@@ -219,5 +236,117 @@ public sealed class ModeFeedbackApiTests : IDisposable
         await poll;
         await stop.CancelAsync();
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => presses);
+    }
+
+    [Fact]
+    public async Task ApplyPending_choice_applied_now_shows_the_flag_it_wrote_before_the_next_poll()
+    {
+        var api = Api();
+        Assert.Equal(202, (await Press(api, "eco")).Status);
+        _flag.View = Flag("eco", "manual");   // what the eco command writes
+        await _service.ApplyPendingAsync(TestContext.Current.CancellationToken);
+        var now = Json(await api.HandleAsync(Req("GET", "/api/now"), TestContext.Current.CancellationToken));
+        Assert.Equal("eco", now.GetProperty("powerMode").GetString());
+    }
+
+    [Fact]
+    public async Task SetMode_press_replacing_one_still_waiting_leaves_a_superseded_event()
+    {
+        var api = Api();
+        Assert.Equal(202, (await Press(api, "eco")).Status);
+        Assert.Equal(202, (await Press(api, "max")).Status);   // the eco never ran
+        var e = Assert.Single(_store.Events(0, long.MaxValue), e => e.Kind == "mode-superseded");
+        Assert.Equal("eco replaced by max before it ran", e.Detail);
+        Assert.Equal(ManualMode.Max, _service.State.ModePending);   // the latest press wins
+    }
+
+    [Fact]
+    public async Task SetMode_same_press_again_or_after_it_applied_supersedes_nothing()
+    {
+        var api = Api();
+        Assert.Equal(202, (await Press(api, "eco")).Status);
+        Assert.Equal(202, (await Press(api, "eco")).Status);
+        await _service.ApplyPendingAsync(TestContext.Current.CancellationToken);
+        Assert.Equal(202, (await Press(api, "max")).Status);
+        Assert.DoesNotContain(_store.Events(0, long.MaxValue), e => e.Kind == "mode-superseded");
+    }
+
+    [Fact]
+    public async Task Mode_reply_carries_the_choice_left_waiting()
+    {
+        var api = Api();
+        var max = Json(await Press(api, "max"));
+        Assert.Equal("max", max.GetProperty("manual").GetString());
+        Assert.Equal("max", max.GetProperty("modePending").GetString());
+        await _service.ApplyPendingAsync(TestContext.Current.CancellationToken);
+        var auto = Json(await Press(api, "auto"));   // Auto after Max runs no command: nothing waits
+        Assert.Equal(JsonValueKind.Null, auto.GetProperty("modePending").ValueKind);
+    }
+
+    [Theory]
+    [InlineData("max", false, PageCodes.MaxPinnedMains)]
+    [InlineData("max", true, PageCodes.MaxPinnedCut)]
+    [InlineData("eco", false, PageCodes.EcoPinnedMains)]
+    [InlineData("eco", true, PageCodes.EcoPinnedCut)]
+    public async Task Now_names_what_holds_a_pinned_choice_and_until_when(string mode, bool cut, string code)
+    {
+        using var service = cut ? InCut() : null;
+        var api = Api(service: service);
+        Assert.Equal(202, (await Press(api, mode)).Status);
+        await (service ?? _service).ApplyPendingAsync(TestContext.Current.CancellationToken);
+        var hold = Json(await api.HandleAsync(Req("GET", "/api/now"), TestContext.Current.CancellationToken)).GetProperty("modeHold");
+        Assert.Equal(code, hold.GetProperty("code").GetString());
+    }
+
+    [Fact]
+    public async Task Now_has_no_hold_under_Auto()
+    {
+        var now = Json(await Api().HandleAsync(Req("GET", "/api/now"), TestContext.Current.CancellationToken));
+        Assert.Equal(JsonValueKind.Null, now.GetProperty("modeHold").ValueKind);
+    }
+
+    [Fact]
+    public async Task SetMode_Auto_after_Max_says_the_rules_take_over_at_the_next_reading_and_asks_for_it_now()
+    {
+        _cfg.Mac = "AA:BB:CC:DD:EE:FF";   // a station to poll: the reading the Auto asks for comes
+        using var service = InCut();
+        var api = Api(service: service);
+        Assert.Equal(202, (await Press(api, "max")).Status);
+        await service.ApplyPendingAsync(TestContext.Current.CancellationToken);
+        Assert.Equal(202, (await Press(api, "auto")).Status);
+        var hold = Json(await api.HandleAsync(Req("GET", "/api/now"), TestContext.Current.CancellationToken)).GetProperty("modeHold");
+        Assert.Equal(PageCodes.AutoNext, hold.GetProperty("code").GetString());
+        Assert.True(service.TakePollRequest());   // the loop reads the station now instead of at its minute
+        Assert.False(service.TakePollRequest());
+        var settle = api.HandleAsync(Req("GET", "/api/now?settle=1"), TestContext.Current.CancellationToken);
+        Assert.False(settle.IsCompleted);   // settles on the reading the Auto asked for
+        await service.PollAsync(TestContext.Current.CancellationToken);
+        var now = Json(await settle.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
+        Assert.Equal(JsonValueKind.Null, now.GetProperty("modeHold").ValueKind);
+    }
+
+    // No station to poll (no address, no cloud): the loop only idles, so the Auto waits for no reading and the settle
+    // answers at once instead of after its whole window.
+    [Fact]
+    public async Task SetMode_Auto_after_Max_with_nothing_to_poll_waits_for_no_reading()
+    {
+        using var service = InCut();
+        var api = Api(service: service);
+        Assert.NotNull(_cfg.PollProblem);
+        Assert.Equal(202, (await Press(api, "max")).Status);
+        await service.ApplyPendingAsync(TestContext.Current.CancellationToken);
+        Assert.Equal(202, (await Press(api, "auto")).Status);
+        Assert.False(service.AutoAwaitsReading);
+        Assert.False(service.TakePollRequest());
+        var now = Json(await api.HandleAsync(Req("GET", "/api/now?settle=1"), TestContext.Current.CancellationToken)
+            .WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
+        Assert.Equal(JsonValueKind.Null, now.GetProperty("modeHold").ValueKind);
+    }
+
+    /// <summary>A service that starts inside a confirmed cut (its saved state), the station not answering.</summary>
+    private StationService InCut()
+    {
+        _store.SaveState(new StationState { Cut = true, CutSince = T0.AddMinutes(-10), OffSince = T0.AddMinutes(-15) });
+        return new StationService(_cfg, new QueueReader(), _actions, new FakeHibernator(true), _flag, _store, _clock, _ => { });
     }
 }

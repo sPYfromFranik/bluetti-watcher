@@ -8,7 +8,7 @@ or Unix milliseconds.
 
 - Every request: the `Host` header must be exactly `127.0.0.1:<port>` or `localhost:<port>`; anything else is `403
   forbidden: foreign Host`. This blocks DNS rebinding.
-- `POST /api/mode` and `POST /api/return-plan` also need the header `X-Station: 1` and an `Origin` that is absent or the service's own
+- `POST /api/mode`, `POST /api/return-plan`, `POST /api/reading-source`, `POST /api/cloud/sign-in` and `POST /api/cloud/sign-out` also need the header `X-Station: 1` and an `Origin` that is absent or the service's own
   (`http://127.0.0.1:<port>` or `http://localhost:<port>`); else 403 with the reason. A web page on another origin
   cannot send the custom header without a CORS preflight, and the service never sends a CORS header.
 - Wrong method: 405 (`POST only` for `/api/mode`, `GET only` elsewhere; `/api/return-plan` takes both). Unknown path: 404.
@@ -19,7 +19,7 @@ The dashboard page (`text/html`). Also `/index.html`.
 
 ## GET /api/now
 
-The current state, for the page. `?settle=1` answers once a saved page choice (`modePending`) is applied, refused or failed, at most 8 s later; at once when none waits.
+The current state, for the page. `?settle=1` answers once a saved page choice (`modePending`) is applied, refused or failed, at most 8 s later; at once when none waits. Every wait counts against the time left in the request's 10 s: a request that started late answers sooner, with the state as it is.
 
 | Field | Meaning |
 |---|---|
@@ -28,10 +28,11 @@ The current state, for the page. `?settle=1` answers once a saved page choice (`
 | `eco`, `ecoNote` | The power mode in words ("" when normal) and as a coded note. |
 | `manual` | The page's choice: `auto`, `eco`, `max`. `modePending`: a choice not applied yet, or null. |
 | `modeError`, `modeErrorNote` | The last refusal or failure of a page choice ("" when none), and as a coded note. |
-| `powerMode` | The flag's mode in force as the service last read it: `normal`, `eco`, `emergency`, or `unreadable` (not read yet or untrusted). |
+| `powerMode` | The flag's mode in force as the service last read it (on a poll and right after an applied page choice): `normal`, `eco`, `emergency`, or `unreadable` (not read yet or untrusted). |
+| `modeHold` | What holds the mode, as a coded note, or null under Auto: `max-pinned-cut`, `max-pinned-mains`, `eco-pinned-cut`, `eco-pinned-mains` (pinned until mains returns or goes, or Auto), `auto-next` (Auto pressed: the battery rules decide at the next reading, which is taken at once). |
 | `powerPlan` | The active Windows power plan as the switch reads it (`powercfg /list`): `{ "id": "high" \| "balanced" \| "saver" \| "other" \| "", "name" }`; `""` = unknown. |
 | `returnPlan` | The plan the end of eco sets (see `/api/return-plan`). |
-| `level` | Battery level: `ok`, `low`, `critical`, `hibernating`. |
+| `level` | Battery level in the cut: `ok`, `low` (emergency), `critical` (stop), `warning` (the hibernate warning was given; the PC hibernates at `hibernateAt`). |
 | `cut` | true while a power cut is confirmed. |
 | `grid` | Mains: `on`, `off`, `unknown`. |
 | `silent` | true while the station does not answer. |
@@ -44,8 +45,9 @@ The current state, for the page. `?settle=1` answers once a saved page choice (`
 | `runtimeSource` | `model` (fitted to this station's discharges), `rate` (measured), `learned`, `config`; null without an estimate. |
 | `ratePerHour` | Measured discharge, % per hour, whenever the readings yield one (with `runtimeSource` `rate` or `model`); else null. |
 | `learnedEfficiency` | The learned efficiency, or null. |
-| `thresholds` | `emergencyAt`, `stopAt`, `warnAt`, `hibernateAt`. |
-| `last` | The last accepted reading, or null: `at`, `soc`, `inAc`, `inDc`, `outAc`, `outDc`, `volt`, `hz`, `mains`; the grid input `gridVolt` (V) and `gridHz`, V1 registers 77 and 80 of the AC200PL over Bluetooth, else null. |
+| `thresholds` | `emergencyAt`, `stopAt`, `warnAt`, `hibernateAt`, as configured. |
+| `effectiveThresholds` | The levels the last accepted reading was decided on: `emergencyAt`, `stopAt`, `warnAt`, `hibernateAt`, each the configured one raised by the measured drain (design.md section 6), and `drainPerHour` (% per hour, capped at 120; null = no measured drain, the configured levels). |
+| `last` | The last accepted reading, or null: `at`, `soc`, `inAc`, `inDc`, `outAc`, `outDc`, `volt`, `hz`, `mains`; the grid input `gridVolt` (V) and `gridHz`, V1 registers 77 and 80 of the AC200PL over Bluetooth, else null. `station`: a V2 station's own values, else null: `packVolt`, `packAmp`, `minutesToFull`, `minutesToEmpty`, `emptyGapHours` (the station's time to empty minus `hoursLeft`, hours), `warnings` and `faults` (code lists, null when that block was not read), `tempAmbient`, `tempInverter`, `tempPvDcDc` (°C). |
 | `wake` | The wake timer, or null: `everyMinutes`, `floorPercent`, `armed`, `wakeAt`, `disarmOwed`, `error`. |
 | `dtekWatcher` | The DTEK module (below). |
 
@@ -90,7 +92,7 @@ less returns each stored row (raw minutes, and 5-minute aggregates for older tim
 
 Stored events, same time defaults: `{ "events": [ { "at", "kind", "detail" } ] }`. Kinds include `eco-on`,
 `emergency-on`, `mains-back`, `stop`, `hibernate-warning`, `hibernate`, `hibernate-refused`, `hibernate-skipped`,
-`hibernate-delayed`, `mode-dropped`, `mode-refused`, `grid-voltage-high`, action failures, `wake-*` and `dtek-watcher-*`.
+`hibernate-delayed`, `mode-dropped`, `mode-refused`, `grid-voltage-high`, `station-warning`, `station-fault`, `station-alarm-cleared`, `station-hot`, action failures, `wake-*` and `dtek-watcher-*`.
 
 ## GET /api/health
 
@@ -104,7 +106,10 @@ Stored events, same time defaults: `{ "events": [ { "at", "kind", "detail" } ] }
 | `lastPollAt`, `lastAcceptedAt` | Times of the last poll and the last accepted reading, or null. |
 | `lastSource` | `bluetooth` or `cloud`: the source of the last accepted reading, or null. |
 | `bluetoothEncrypted` | true once the station opened the encrypted Bluetooth handshake: the built-in reader reads unencrypted stations only, so it is not connected to again until the service restarts and the cloud fallback answers. Information, not a problem: `ok` does not change. false otherwise. |
+| `readingSource` | The source in force: `auto`, `bluetooth` or `cloud` (see `/api/cloud`). |
+| `cloud` | The cloud's state `{ "state", "detail", "at" }`: `off` (the source never calls it) · `signed-out` (no token) · `ok` · `sign-in-needed` (the server refused the token refresh: sign in again) · `error` (the last read failed; `detail` names why). `at` = when it was seen, or null. Never a token. |
 | `bluetoothStalled` | true while a Bluetooth read abandoned at `readerTimeoutSec` plus 2 s (a Bluetooth call that ignored its timeout) is still running: no new Bluetooth read starts and the cloud fallback answers, until it ends or, after max(4 x that bound, 2 minutes), is given up. Information, not a problem: `ok` does not change. false otherwise. |
+| `stationBlocks` | The station's optional register blocks (`battery`, `stationTime`, `alarms`, `temperatures`) and whether it serves them: `supported`, `not supported: <why>` (until the service restarts), `not asked yet`, or `not on this protocol (V1)`. Information only. |
 | `misses` | Misses in a row. |
 | `silent` | true while the station does not answer. |
 | `rawRows`, `aggregateRows` | Rows in the database. |
@@ -115,6 +120,28 @@ The power plan every end of eco sets: `returnPlan` in `power-mode.config.json` b
 GET answers `{ "returnPlan": "high" | "balanced" | "previous" | "custom" }` (`custom` = a plan GUID set by hand; no file = `high`); `/api/now` carries the same field.
 POST body `{"returnPlan": "high" | "balanced" | "previous"}`, headers per the guard above; every other key of the file is kept, the write is a temp file moved over it.
 Answer `{ "ok", "returnPlan", "message" }`: 200 saved · 400 a body that is not JSON or another value · 409 the flag folder does not exist yet or the file is not a JSON object (nothing written) · 500 the write failed (the old file stays).
+
+## GET /api/cloud, POST /api/reading-source, POST /api/cloud/sign-in, POST /api/cloud/sign-out
+
+The reading source and the BLUETTI cloud account ([design.md §4](design.md#reading-source)). Every answer of the four is
+the same object:
+
+```json
+{ "readingSource": "auto", "readingSourceFrom": "default", "cloud": { "state": "ok", "detail": "...", "at": null },
+  "signIn": { "state": "idle", "message": "", "at": null } }
+```
+
+| Field | Meaning |
+|---|---|
+| `readingSource` | `auto`, `bluetooth` or `cloud`. |
+| `readingSourceFrom` | `page` (saved by the page, `reading-source.json`), `config` (`readingSource` or `cloudEnabled: false` in config.json) or `default`. |
+| `cloud` | As in `/api/health`. |
+| `signIn` | The page's sign-in: `idle`, `waiting` (for the browser, at most 5 minutes), `signed-in`, `failed`; `message` the last line in English (never a token). |
+| `authorizeUrl` | Only in the answer of `POST /api/cloud/sign-in`: the BLUETTI sign-in address for the page to open. |
+
+- `POST /api/reading-source` body `{"readingSource": "auto" | "bluetooth" | "cloud" | "config"}`: saved and in force from the next poll, no restart; `config` deletes the page's choice so the config applies again. 200 · 400 another body · 409 with that source nothing would be polled (e.g. `bluetooth` for a model Bluetooth does not read, or without a `mac`): the reason, nothing changed · 500 not written or not deleted (nothing changed).
+- `POST /api/cloud/sign-in`: starts the `--cloud-login` flow inside the service, its catcher on `127.0.0.1` at a port the OS assigns. 202 with `authorizeUrl`; a second call while one waits answers the same address · 502 it could not start.
+- `POST /api/cloud/sign-out`: stops a waiting sign-in and deletes the token file. 200 · 503 a cloud read holds the reader past 5 s (try again) · 500 the file could not be deleted.
 
 ## POST /api/mode
 
@@ -128,5 +155,6 @@ The page's Eco fires the `eco` action and Max (or Auto lifting the page's Eco) f
 them: an executable with arguments, no shell, logged only in a dry run ([configuration.md](configuration.md), "Power
 mode and actions"; the power-mode commands have their own limit, `powerModeTimeoutSec`).
 
-Answer: `{ "ok", "accepted", "manual", "message", "code" }`. 202 = saved; the service loop applies it. 409 = Max or Eco refused
+Answer: `{ "ok", "accepted", "manual", "modePending", "message", "code" }`. 202 = saved; the service loop applies it;
+`modePending` is the choice left for it to run (null when the press runs no command, as Auto after Max). 409 = Max or Eco refused
 during a battery emergency (`code` names it: `max-held`, `eco-held`). 400 = a body that is not JSON or a mode that is not one of the three.

@@ -1,11 +1,16 @@
 using System.Globalization;
+using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 
 namespace BluettiWatcher.Decision;
 
 internal enum Grid { Unknown, On, Off }
 
-internal enum Level { Ok, Low, Critical, Hibernating }
+/// <summary>
+/// Where the battery stands in the cut. Warning: the hibernate warning was given; the PC hibernates once the battery is at
+/// or under hibernateAt. Its saved name stays "Hibernating" so a state saved by an earlier version loads.
+/// </summary>
+internal enum Level { Ok, Low, Critical, [JsonStringEnumMemberName("Hibernating")] Warning }
 
 /// <summary>The battery levels in the order they are reached.</summary>
 internal enum LevelStep { Emergency = 0, Stop = 1, Warn = 2, Hibernate = 3 }
@@ -24,7 +29,7 @@ internal enum ManualMode { Auto, Eco, Max }
 /// <summary>One answer of the station. A missing or unparseable field is null. Grid* = the grid input (AC200PL over Bluetooth only).</summary>
 internal sealed record Reading(double? Soc, double? InAc, double? OutAc, string? Mode,
     double? InDc = null, double? OutDc = null, double? Volt = null, double? Hz = null, string? Source = null,
-    double? GridVolt = null, double? GridHz = null);
+    double? GridVolt = null, double? GridHz = null, StationExtras? Extras = null);
 
 /// <summary>The power-mode flag as the decision sees it; mode <c>unreadable</c> when it cannot be trusted.</summary>
 internal sealed record FlagView(string Mode, string Source, string By, DateTimeOffset? SinceAt)
@@ -34,6 +39,21 @@ internal sealed record FlagView(string Mode, string Source, string By, DateTimeO
 }
 
 internal sealed record BatteryReport(double Soc, Level Level, bool Mains);
+
+/// <summary>
+/// The battery levels one poll applies: each at least the configured one, raised by the measured drain
+/// (<see cref="StationDecision.Effective"/>). <see cref="DrainPerHour"/>: the drain they follow, capped; null = the configured levels.
+/// </summary>
+internal sealed record Thresholds(double EmergencyAt, double StopAt, double WarnAt, double HibernateAt, double? DrainPerHour)
+{
+    public double At(LevelStep step) => step switch
+    {
+        LevelStep.Emergency => EmergencyAt,
+        LevelStep.Stop => StopAt,
+        LevelStep.Warn => WarnAt,
+        _ => HibernateAt,
+    };
+}
 
 internal sealed record StationDecisionResult(StationState State, IReadOnlyList<StationAction> Actions, int DelaySec, BatteryReport? Battery, string Rejected);
 
@@ -50,17 +70,46 @@ internal static partial class StationDecision
     [
         (LevelStep.Emergency, Level.Low),
         (LevelStep.Stop, Level.Critical),
-        (LevelStep.Warn, Level.Hibernating),
-        (LevelStep.Hibernate, Level.Hibernating),
+        (LevelStep.Warn, Level.Warning),
+        (LevelStep.Hibernate, Level.Warning),
     ];
 
-    public static double Threshold(LevelStep step, StationConfig c) => step switch
+    /// <summary>
+    /// The highest drain, battery points per hour, the levels follow: above what a station of this class drains at its rated
+    /// output (an AC200PL at 2000 W, about 100 %/h). A higher estimate counts as this, so one wild sample raises the warning
+    /// by at most 10 points and never moves hibernateAt.
+    /// </summary>
+    public const double MaxDrainPerHour = 120;
+
+    /// <summary>Poll intervals of drain kept between two levels: one for the ladder's own step (one level per poll), one as the margin.</summary>
+    public const int LeadPolls = 2;
+
+    /// <summary>
+    /// The levels a poll applies. With a sound drain (finite, above 0; capped at <see cref="MaxDrainPerHour"/>) each level
+    /// above hibernateAt sits at least the drain of its lead above the one under it: the warning hibernateAfterWarnSec plus
+    /// <see cref="LeadPolls"/> polls above hibernateAt (so the hibernate comes at its first agreed poll at or under it), the
+    /// stop and the emergency <see cref="LeadPolls"/> polls above the next. A level never goes under its configured value
+    /// nor more than <see cref="MaxRaise"/> points over it (a long poll interval asks for more: the raise stops there);
+    /// hibernateAt never moves (the fresh-reading guard and the wake read it). No drain, a stale one (the caller passes
+    /// null) or an unsound one = the configured levels.
+    /// </summary>
+    public static Thresholds Effective(StationConfig c, double? drainPerHour)
     {
-        LevelStep.Emergency => c.EmergencyAt,
-        LevelStep.Stop => c.StopAt,
-        LevelStep.Warn => c.WarnAt,
-        _ => c.HibernateAt,
-    };
+        if (drainPerHour is not { } d || !double.IsFinite(d) || d <= 0) return new(c.EmergencyAt, c.StopAt, c.WarnAt, c.HibernateAt, null);
+        d = Math.Min(d, MaxDrainPerHour);
+        double perSec = d / 3600, poll = Math.Max(c.PollSec, c.FastPollSec);
+        double warn = Raise(c.WarnAt, c.HibernateAt + perSec * (c.HibernateAfterWarnSec + LeadPolls * poll));
+        double stop = Raise(c.StopAt, warn + perSec * LeadPolls * poll);
+        double emergency = Raise(c.EmergencyAt, stop + perSec * LeadPolls * poll);
+        return new(emergency, stop, warn, c.HibernateAt, d);
+    }
+
+    /// <summary>The most a drain lifts a level over its configured value, whatever pollSec and hibernateAfterWarnSec are.</summary>
+    public const double MaxRaise = 10;
+
+    /// <summary>The configured level, or the needed one rounded up to a tenth (at most configured + <see cref="MaxRaise"/>, at most 100) when that is higher.</summary>
+    private static double Raise(double configured, double needed) =>
+        needed > configured ? Math.Max(configured, Math.Min(Math.Min(100, configured + MaxRaise), Math.Ceiling(needed * 10) / 10)) : configured;
 
     [GeneratedRegex("^[A-Z][A-Z_]*$")]
     private static partial Regex ModePattern();
@@ -137,8 +186,9 @@ internal static partial class StationDecision
     private static bool Agreed(StationState s, LevelStep step, DateTimeOffset now, StationConfig c) =>
         s.Since[(int)step] is { } st && (now - st).TotalSeconds >= Math.Max(1, c.AgreeSec);
 
-    public static StationDecisionResult Decide(Reading? reading, StationState? state, FlagView flag, DateTimeOffset now, StationConfig c)
+    public static StationDecisionResult Decide(Reading? reading, StationState? state, FlagView flag, DateTimeOffset now, StationConfig c, double? drainPerHour = null)
     {
+        var th = Effective(c, drainPerHour);
         var s = StationState.Normalize(state).Clone();   // a copy: the caller's state is never changed
         var actions = new List<StationAction>();
 
@@ -220,7 +270,7 @@ internal static partial class StationDecision
             bool streakRuns = s.Since[(int)LevelStep.Hibernate] is not null;
             foreach (var (step, _) in Steps)
             {
-                if (soc <= Threshold(step, c)) s.Since[(int)step] ??= now;
+                if (soc <= th.At(step)) s.Since[(int)step] ??= now;
                 else s.Since[(int)step] = null;
             }
             s.RebaseConfirmedSec = streakRuns && s.Since[(int)LevelStep.Hibernate] is not null ? s.RebaseConfirmedSec + confirmStepSec : 0;

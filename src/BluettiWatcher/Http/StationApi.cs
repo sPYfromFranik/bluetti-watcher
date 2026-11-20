@@ -17,7 +17,8 @@ namespace BluettiWatcher.Http;
 /// from / to: ISO 8601 or Unix milliseconds; step: seconds (default 60).
 /// </summary>
 internal sealed class StationApi(StationConfig config, StationService service, StationStore store, TimeProvider time, DateTimeOffset startedAt, IDtekWatcher? dtek = null, Action<string>? log = null,
-    Func<bool>? bluetoothEncrypted = null, Func<bool>? bluetoothStalled = null, Func<(string Guid, string Name)>? activePlan = null)
+    Func<bool>? bluetoothEncrypted = null, Func<bool>? bluetoothStalled = null, Func<(string Guid, string Name)>? activePlan = null, CloudAccount? cloud = null,
+    Func<IReadOnlyList<KeyValuePair<string, string>>>? stationBlocks = null)
 {
     /// <summary>The page, read once; encoded once per coding on first use; a reload with its ETag is a 304.</summary>
     private static readonly Lazy<StaticAsset> Page = new(() =>
@@ -46,14 +47,16 @@ internal sealed class StationApi(StationConfig config, StationService service, S
             if (RequestGuard.WriteRefusal(r, config.Port) is { } why) return HttpResponse.Text(403, "forbidden: " + why);
             return SetReturnPlan(r);
         }
+        if (await CloudRouteAsync(r, ct) is { } cloudAnswer) return cloudAnswer;
         if (r.Method != "GET") return HttpResponse.Text(405, "GET only");
         // /api/now?settle=1: answers once the saved page choice is applied, refused or failed (bounded under the server's 10 s).
-        if (r.Path == "/api/now" && r.Query.TryGetValue("settle", out var settle) && settle == "1") await service.WaitModeSettledAsync(SettleWait, ct);
+        // Both waits count against the time left in the request, so a request that started late still answers in time.
+        if (r.Path == "/api/now" && r.Query.TryGetValue("settle", out var settle) && settle == "1") await service.WaitModeSettledAsync(Bounded(SettleWait, Left(r) - PlanWait), ct);
         var now = time.GetLocalNow();
         return r.Path switch
         {
             "/" or "/index.html" => Page.Value.Respond(r),
-            "/api/now" => HttpResponse.Json(200, Now(now, await ActivePlanAsync(ct))),
+            "/api/now" => HttpResponse.Json(200, Now(now, await ActivePlanAsync(Bounded(PlanWait, Left(r)), ct))),
             "/api/health" => HttpResponse.Json(200, Health(now)),
             "/api/history" => History(r, now),
             "/api/events" => Events(r, now),
@@ -145,6 +148,7 @@ internal sealed class StationApi(StationConfig config, StationService service, S
             w.WriteBoolean("ok", res.Ok);
             w.WriteBoolean("accepted", res.Status == 202);
             w.WriteString("manual", res.Manual.ToString().ToLowerInvariant());
+            if (res.Pending is { } pending) w.WriteString("modePending", pending.ToString().ToLowerInvariant()); else w.WriteNull("modePending");
             w.WriteString("message", res.Message);
             w.WriteString("code", res.Ok ? "" : ModeErrorNote(res.Message)?.Code ?? "");
             w.WriteEndObject();
@@ -156,6 +160,16 @@ internal sealed class StationApi(StationConfig config, StationService service, S
 
     /// <summary>The longest a request waits for a fresh read of the active plan; past it the last one known answers.</summary>
     internal static readonly TimeSpan PlanWait = TimeSpan.FromSeconds(2);
+
+    /// <summary>Kept free at the end of a request to write its answer.</summary>
+    internal static readonly TimeSpan AnswerReserve = TimeSpan.FromSeconds(1);
+
+    /// <summary>What is left of the server's request limit, less the answer's reserve (real time: the limit is).</summary>
+    private static TimeSpan Left(HttpRequest r) =>
+        MiniHttpServer.RequestLimit - System.Diagnostics.Stopwatch.GetElapsedTime(r.StartedAt) - AnswerReserve;
+
+    /// <summary>The wait, at most <paramref name="left"/>, never under zero.</summary>
+    private static TimeSpan Bounded(TimeSpan wait, TimeSpan left) => left <= TimeSpan.Zero ? TimeSpan.Zero : wait < left ? wait : left;
     private readonly Lock _planGate = new();
     private (string Id, string Name) _plan = ("", "");
     private long _planEpoch = -1;
@@ -165,9 +179,9 @@ internal sealed class StationApi(StationConfig config, StationService service, S
     /// <summary>
     /// The active Windows plan for the page: id high | balanced | saver | other ("" = unknown) and its name. Read again only
     /// after a poll, an applied page choice or a plan write moved the epoch; one read at a time, off the request thread
-    /// (powercfg could hang), waited for at most <see cref="PlanWait"/>.
+    /// (powercfg could hang), waited for at most <paramref name="wait"/> (<see cref="PlanWait"/> or less).
     /// </summary>
-    private async Task<(string Id, string Name)> ActivePlanAsync(CancellationToken ct)
+    private async Task<(string Id, string Name)> ActivePlanAsync(TimeSpan wait, CancellationToken ct)
     {
         if (activePlan is null) return ("", "");
         long epoch = service.PlanEpoch + Interlocked.Read(ref _planWrites);
@@ -185,7 +199,7 @@ internal sealed class StationApi(StationConfig config, StationService service, S
         }
         try
         {
-            var (guid, name) = await read.WaitAsync(PlanWait, ct);
+            var (guid, name) = await read.WaitAsync(wait, ct);
             lock (_planGate) { _plan = (PlanId(guid), name); if (ReferenceEquals(_planRead, read)) _planRead = null; return _plan; }
         }
         catch (TimeoutException) { lock (_planGate) return _plan; }
@@ -439,6 +453,7 @@ internal sealed class StationApi(StationConfig config, StationService service, S
             w.WriteString("modeError", service.ModeError);
             w.WriteString("returnPlan", ReturnPlanFile.Read(config.FlagFile));
             Note(w, "modeErrorNote", ModeErrorNote(service.ModeError));
+            Note(w, "modeHold", ModeHold(s, service.AutoAwaitsReading));
             w.WriteString("powerMode", (flag?.View ?? FlagView.Unreadable).Mode);
             w.WriteStartObject("powerPlan");
             w.WriteString("id", plan.Id);
@@ -465,6 +480,14 @@ internal sealed class StationApi(StationConfig config, StationService service, S
             w.WriteNumber("warnAt", config.WarnAt);
             w.WriteNumber("hibernateAt", config.HibernateAt);
             w.WriteEndObject();
+            var th = service.Thresholds;
+            w.WriteStartObject("effectiveThresholds");
+            w.WriteNumber("emergencyAt", th.EmergencyAt);
+            w.WriteNumber("stopAt", th.StopAt);
+            w.WriteNumber("warnAt", th.WarnAt);
+            w.WriteNumber("hibernateAt", th.HibernateAt);
+            Num(w, "drainPerHour", th.DrainPerHour);
+            w.WriteEndObject();
             if (last is not null && lastAt is { } at)
             {
                 w.WriteStartObject("last");
@@ -479,6 +502,7 @@ internal sealed class StationApi(StationConfig config, StationService service, S
                 Num(w, "gridVolt", last.GridVolt);
                 Num(w, "gridHz", last.GridHz);
                 w.WriteBoolean("mains", last.InAc > 0);
+                WriteStationExtras(w, last.Extras, runtime.HoursLeft);
                 w.WriteEndObject();
             }
             else w.WriteNull("last");
@@ -524,6 +548,20 @@ internal sealed class StationApi(StationConfig config, StationService service, S
         foreach (var n in notes) { w.WriteStartObject(); NoteBody(w, n); w.WriteEndObject(); }
         w.WriteEndArray();
     }
+
+    /// <summary>
+    /// What holds the mode, for the line under the buttons: a manual choice lasts until the next observed mains change or
+    /// Auto (design.md §5); an Auto after one waits for the next reading's decision. null = the battery rules decide.
+    /// </summary>
+    internal static PageNote? ModeHold(StationState s, bool autoAwaitsReading) => s.Manual switch
+    {
+        ManualMode.Max when s.Cut => new(PageCodes.MaxPinnedCut, "Max pinned until mains returns or you press Auto"),
+        ManualMode.Max => new(PageCodes.MaxPinnedMains, "Max pinned until mains goes out or you press Auto"),
+        ManualMode.Eco when s.Cut => new(PageCodes.EcoPinnedCut, "Eco pinned until mains returns or you press Auto"),
+        ManualMode.Eco => new(PageCodes.EcoPinnedMains, "Eco pinned until mains goes out or you press Auto"),
+        _ when autoAwaitsReading => new(PageCodes.AutoNext, "Auto: the battery rules decide at the next reading, taken now"),
+        _ => null,
+    };
 
     /// <summary>The saved mode refusal or failure as a coded note; "" = none. The text is the service's; the code is read from its known shapes.</summary>
     internal static PageNote? ModeErrorNote(string error)
@@ -622,6 +660,74 @@ internal sealed class StationApi(StationConfig config, StationService service, S
         foreach (var s in values) w.WriteStringValue(s);
         w.WriteEndArray();
     }
+    /// <summary>
+    /// The reading source and the cloud account (design.md §4 Reading source, Cloud sign-in): GET /api/cloud; behind
+    /// <see cref="RequestGuard"/> POST /api/reading-source { "readingSource": "auto" | "bluetooth" | "cloud" },
+    /// POST /api/cloud/sign-in (answers the authorize address the page opens) and POST /api/cloud/sign-out.
+    /// Null = not one of these routes.
+    /// </summary>
+    private async Task<HttpResponse?> CloudRouteAsync(HttpRequest r, CancellationToken ct)
+    {
+        bool get = r.Path == "/api/cloud";
+        if (!get && r.Path is not ("/api/reading-source" or "/api/cloud/sign-in" or "/api/cloud/sign-out")) return null;
+        if (get != (r.Method == "GET")) return HttpResponse.Text(405, get ? "GET only" : "POST only");
+        if (cloud is null) return HttpResponse.Text(404, "not found");
+        if (get) return HttpResponse.Json(200, Write(w => CloudJson(w, null)));
+        if (RequestGuard.WriteRefusal(r, config.Port) is { } why) return HttpResponse.Text(403, "forbidden: " + why);
+        switch (r.Path)
+        {
+            case "/api/reading-source":
+                string? name;
+                try
+                {
+                    using var doc = JsonDocument.Parse(r.Body);
+                    name = doc.RootElement.ValueKind == JsonValueKind.Object && doc.RootElement.TryGetProperty("readingSource", out var v) && v.ValueKind == JsonValueKind.String
+                        ? v.GetString() : null;
+                }
+                catch (JsonException) { name = null; }
+                // "config" clears the page's choice: the config key applies again.
+                var source = ReadingSourceFile.Parse(name);
+                if (source is null && name != "config") return HttpResponse.Text(400, "body must be JSON { \"readingSource\": \"auto\" | \"bluetooth\" | \"cloud\" | \"config\" }");
+                var (status, error) = cloud.SetSource(source);
+                return status == 200 ? HttpResponse.Json(200, Write(w => CloudJson(w, null))) : HttpResponse.Text(status, error);
+            case "/api/cloud/sign-in":
+                var (url, failed) = await cloud.StartSignInAsync(ct);
+                // The address carries the login's one-time state: it goes to this page only, never to a log.
+                return url is null ? HttpResponse.Text(502, failed.Length > 0 ? failed : "the sign-in did not start") : HttpResponse.Json(202, Write(w => CloudJson(w, url)));
+            default:
+                var (outStatus, outError) = await cloud.SignOutAsync(ct);
+                return outStatus == 200 ? HttpResponse.Json(200, Write(w => CloudJson(w, null))) : HttpResponse.Text(outStatus, outError);
+        }
+    }
+
+    /// <summary>{ readingSource, readingSourceFrom, cloud: { state, detail, at }, signIn: { state, message, at }, authorizeUrl? }.</summary>
+    private void CloudJson(Utf8JsonWriter w, Uri? authorize)
+    {
+        w.WriteStartObject();
+        w.WriteString("readingSource", ReadingSourceFile.Name(config.Source));
+        w.WriteString("readingSourceFrom", config.PageSource is not null ? "page" : config.ReadingSource is not null || config.CloudEnabled == false ? "config" : "default");
+        CloudState(w);
+        var s = cloud!.SignIn;
+        w.WriteStartObject("signIn");
+        w.WriteString("state", s.State);
+        w.WriteString("message", s.Message);
+        if (s.At is { } at) w.WriteString("at", Iso(at)); else w.WriteNull("at");
+        w.WriteEndObject();
+        if (authorize is not null) w.WriteString("authorizeUrl", authorize.AbsoluteUri);
+        w.WriteEndObject();
+    }
+
+    /// <summary>"cloud": { state, detail, at } (<see cref="BluettiCloudReader.Status"/>); without the cloud account, from the config alone.</summary>
+    private void CloudState(Utf8JsonWriter w)
+    {
+        var c = cloud?.Status() ?? new CloudStatus(!config.CloudOn ? "off" : File.Exists(config.CloudTokenFile) ? "ok" : "signed-out", "", null);
+        w.WriteStartObject("cloud");
+        w.WriteString("state", c.State);
+        w.WriteString("detail", c.Detail);
+        if (c.At is { } at) w.WriteString("at", Iso(at)); else w.WriteNull("at");
+        w.WriteEndObject();
+    }
+
     private byte[] Health(DateTimeOffset now)
     {
         var s = service.State;
@@ -642,11 +748,36 @@ internal sealed class StationApi(StationConfig config, StationService service, S
             w.WriteBoolean("bluetoothEncrypted", bluetoothEncrypted?.Invoke() ?? false);
             // Also information: a Bluetooth read abandoned at its hard bound is still alive (until it ends or is given up).
             w.WriteBoolean("bluetoothStalled", bluetoothStalled?.Invoke() ?? false);
+            w.WriteString("readingSource", ReadingSourceFile.Name(config.Source));
+            CloudState(w);
             w.WriteNumber("misses", s.Misses);
             w.WriteBoolean("silent", s.Silent);
             w.WriteNumber("rawRows", raw);
             w.WriteNumber("aggregateRows", agg);
+            // The station's optional register blocks (V2 stations) and whether it serves them: the live check after an install.
+            w.WriteStartObject("stationBlocks");
+            foreach (var (name, support) in stationBlocks?.Invoke() ?? []) w.WriteString(name, support);
+            w.WriteEndObject();
             w.WriteEndObject();
         });
+    }
+
+    /// <summary>The station's own extras of the last reading (V2 stations); the station's time to empty beside the watcher's.</summary>
+    private static void WriteStationExtras(Utf8JsonWriter w, StationExtras? x, double? hoursLeft)
+    {
+        if (x is null) { w.WriteNull("station"); return; }
+        w.WriteStartObject("station");
+        Num(w, "packVolt", x.PackVolt);
+        Num(w, "packAmp", x.PackAmp);
+        Num(w, "minutesToFull", x.StationMinutesToFull, 0);
+        Num(w, "minutesToEmpty", x.StationMinutesToEmpty, 0);
+        // Station minus watcher, hours: positive = the station expects longer than the watcher's estimate.
+        Num(w, "emptyGapHours", x.StationMinutesToEmpty is { } m && hoursLeft is { } h ? m / 60.0 - h : null, 2);
+        if (x.Warnings is { } warnings) Strings(w, "warnings", warnings); else w.WriteNull("warnings");
+        if (x.Faults is { } faults) Strings(w, "faults", faults); else w.WriteNull("faults");
+        Num(w, "tempAmbient", x.TempAmbient, 0);
+        Num(w, "tempInverter", x.TempInverter, 0);
+        Num(w, "tempPvDcDc", x.TempPvDcDc, 0);
+        w.WriteEndObject();
     }
 }

@@ -36,10 +36,22 @@ internal sealed class PowerModeAdapter(StationConfig config, IProcessRunner runn
     public static IReadOnlyList<string> EmergencyArgs { get; } = ["on", "-Source", "station"];
     public static IReadOnlyList<string> LiftArgs { get; } = ["off", "-Source", "station"];
 
+    /// <summary>
+    /// The flag's level word (ok, low, critical, hibernating). From the warning on the flag says hibernating: the hook's
+    /// "the PC hibernates at N %: save now" is the warning, and the flag format stays as installed switches read it.
+    /// </summary>
+    public static string FlagLevel(Level level) => level switch
+    {
+        Level.Low => "low",
+        Level.Critical => "critical",
+        Level.Warning => "hibernating",
+        _ => "ok",
+    };
+
     public static IReadOnlyList<string> BatteryArgs(BatteryReport b, double hibernateAt)
     {
         var inv = CultureInfo.InvariantCulture;
-        return ["battery", "-Soc", b.Soc.ToString("0.##", inv), "-Level", b.Level.ToString().ToLowerInvariant(),
+        return ["battery", "-Soc", b.Soc.ToString("0.##", inv), "-Level", FlagLevel(b.Level),
             "-Mains", b.Mains ? "on" : "off", "-HibernateAt", hibernateAt.ToString("0.##", inv)];
     }
 
@@ -81,9 +93,11 @@ internal sealed class PowerModeAdapter(StationConfig config, IProcessRunner runn
         if (r.TimedOut && InProcess) log($"power-mode {switchArgs[0]} -> no answer in {ms} ms, still running (it may yet write the flag)");
         else log($"power-mode {switchArgs[0]} -> exit {r.ExitCode} in {ms} ms{(ok ? "" : ": " + last)}");
         // A step that failed or was not confirmed (warn: / note:) is never silent: exit 0 means the flag is written, not that
-        // the plan or the GPU cap took. The battery call is left out: it runs on every reading change and repeats them.
+        // the plan or the GPU cap took; the plan recorded and the one returned to (plan:) say what the switch did to Windows.
+        // The battery call is left out: it runs on every reading change and repeats them.
         if (switchArgs[0] != "battery")
-            foreach (var l in r.Lines.Where(l => l.StartsWith("warn: ", StringComparison.Ordinal) || l.StartsWith("note: ", StringComparison.Ordinal)))
+            foreach (var l in r.Lines.Where(l => l.StartsWith("warn: ", StringComparison.Ordinal) || l.StartsWith("note: ", StringComparison.Ordinal)
+                || l.StartsWith("plan: ", StringComparison.Ordinal)))
                 log($"power-mode {switchArgs[0]}: {l}");
         return new ActionResult(ok, r.ExitCode, line, last);
     }

@@ -185,8 +185,11 @@ Reporting a vulnerability: [SECURITY.md](SECURITY.md).
   `"dtekWatcher": { "enabled": true, "queues": ["GPV1.1"] }` (add `"site": true` to also read the distributor's website: faster plan edits, subject to its terms); details:
   [docs/design.md](docs/design.md#11-dtek-module-planned-outages-kyiv-region).
 - **Cloud fallback** (unofficial, read only): when Bluetooth does not answer, the reading comes from the BLUETTI cloud.
-  Sign in once with `& "$env:LOCALAPPDATA\bluetti-watcher\bin\BluettiWatcher.exe" --cloud-login`; it may stop working
-  if BLUETTI changes its API. Details: [docs/design.md](docs/design.md#4-cloud-fallback).
+  Sign in on the dashboard with "Sign in to BLUETTI cloud" (or once with
+  `& "$env:LOCALAPPDATA\bluetti-watcher\bin\BluettiWatcher.exe" --cloud-login`); the dashboard shows the cloud's state
+  and asks for a new sign-in when BLUETTI refuses the saved token. The Reading source buttons (or `readingSource` in
+  config.json) pick Auto (Bluetooth, then the cloud), Bluetooth only (never the cloud) or Cloud only (never
+  Bluetooth). It may stop working if BLUETTI changes its API. Details: [docs/design.md](docs/design.md#4-cloud-fallback).
 - **Claude Code integration**: `BluettiWatcher.exe hook` tells each Claude Code session on the PC the power mode and battery
   level, so sessions save work and avoid heavy jobs during a cut; no Node.js needed: [integrations/claude-code](integrations/claude-code/README.md).
 
@@ -276,6 +279,11 @@ The command line: `--help`, `--version` and the power-mode switch (`power-mode s
 To update, run `install.ps1 -Apply` from the new release's folder. `config.json`, the history and the cloud token stay;
 the new exe is staged next to the running one and swapped in seconds, and a failed health check puts the previous
 version back. What changed: [CHANGELOG.md](CHANGELOG.md).
+
+Going back from 1.7 to 1.6 or older: from 1.7 an eco's end task starts `bin\BluettiWatcherService.exe`, which older
+releases do not have, so after the swap that task cannot start and the eco does not end at its time. Leave eco before
+installing the older release (`power-mode.ps1 off`, step 2 below), or run it once after the swap: it ends the eco and
+removes that end task; an eco set after that registers its end task against the older exe.
 
 <details>
 <summary>Uninstall</summary>
