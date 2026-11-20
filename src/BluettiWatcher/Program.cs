@@ -78,7 +78,11 @@ if (!config.Modes.V2On && !string.Equals(config.Modes.Engine, BluettiWatcher.Mod
     Log($"CONFIG - modes.engine \"{config.Modes.Engine}\" is not legacy or v2: legacy is used");
 using var modes = config.Modes.V2On ? new BluettiWatcher.Modes.ModesEngine(config, new BluettiWatcher.Modes.ModuleRegistry(BluettiWatcher.Modes.ModuleCatalog.Production(config, runner, time, store.AddEvent, Log)),
     new BluettiWatcher.Modes.ModesStore(config.DataDir), new BluettiWatcher.Modes.ModeJournal(Path.Combine(config.DataDir, BluettiWatcher.Modes.ModeJournal.FileName)),
-    new BluettiWatcher.Modes.SwitchFlagWordWriter(config, Log), time, Log, (kind, detail) => store.AddEvent(time.GetLocalNow(), kind, detail)) : null;
+    new BluettiWatcher.Modes.SwitchFlagWordWriter(config, Log), time, Log, (kind, detail) => store.AddEvent(time.GetLocalNow(), kind, detail))
+    {
+        // Read, never written: an entry it lacks is said on the page with the elevated --broker-allow command.
+        ReadPolicy = () => BluettiWatcher.Modes.Broker.BrokerPolicy.Read(BluettiWatcher.Modes.Broker.BrokerPaths.Default.Policy),
+    } : null;
 modes?.Start(time.GetUtcNow() - TimeSpan.FromMilliseconds(Environment.TickCount64));
 using var service = new StationService(config, new FallbackReader(bluetooth, cloud, () => config.CloudOn, r => StationDecision.Check(r, new StationState(), time.GetUtcNow(), config), Log, () => config.CloudOnly), new PowerModeAdapter(config, runner, Log, new BluettiWatcher.PowerMode.InProcessPowerMode()),
     config.DryRun ? new DryRunHibernator(Log) : new ShutdownHibernator(runner, Log),
@@ -92,6 +96,8 @@ using var dtek = DtekWatcherGuard.Create(config, store, time, Log);
 // The Auto rules' cutWithin reads the schedule's next planned outage (the guard never throws; off = no outage known).
 service.NextCut = () => dtek.View(service.State.Cut, null).NextStart;
 using var stop = new CancellationTokenSource();
+// A mode change runs on the engine's lifetime, never a request's: the service's stop is what ends one half-way.
+using var stopModes = stop.Token.Register(() => modes?.Shutdown());
 // The page's sign-in: the --cloud-login flow inside the service, its catcher on a port the OS assigns; the token is written through the reader's lock.
 using var signInHttp = new SocketsHttpHandler();
 using var account = new CloudAccount(config, cloud, signInHttp, time, Log, stop.Token);

@@ -12,7 +12,11 @@ internal sealed class ModesEngine(StationConfig config, ModuleRegistry registry,
     TimeProvider time, Action<string> log, Action<string, string>? onEvent = null) : IDisposable
 {
     private readonly SemaphoreSlim _gate = new(1, 1);
+    /// <summary>The engine's own lifetime: a change runs on it, so only the service's shutdown stops one half-way.</summary>
+    private readonly CancellationTokenSource _lifetime = new();
     private readonly ModeReconciler _reconciler = new(registry, journal, time, onEvent);
+    private Task _pending = Task.CompletedTask;
+    private volatile string? _switching;
     private ModesSettings _settings = new();
     private SelectorInput? _input;
     private string _reason = "";
@@ -26,11 +30,58 @@ internal sealed class ModesEngine(StationConfig config, ModuleRegistry registry,
     public ReconcileSnapshot Snapshot => _reconciler.Snapshot;
     public string Reason => _reason;
     public bool Emergency => _emergency;
-    /// <summary>Start problems (settings or journal), shown by the API until the next start.</summary>
-    public IReadOnlyList<string> Problems => [.. _problems];
-    public bool AutoHibernate => _settings.AutoHibernate;
+    /// <summary>Start problems (settings or journal), shown by the API until the next start; then the active mode's entries the broker policy does not allow.</summary>
+    public IReadOnlyList<string> Problems => [.. _problems, .. _policyProblems];
 
-    public void Dispose() => _gate.Dispose();
+    /// <summary>
+    /// The admin broker's policy (the user can read it, only an elevated step writes it); null = none or unreadable, and
+    /// then no entry is warned about (the broker's health says that).
+    /// </summary>
+    public Func<Broker.BrokerPolicy?> ReadPolicy { get; init; } = () => null;
+
+    /// <summary>The exe a warning's <c>--broker-allow</c> command runs.</summary>
+    public string ExePath { get; init; } = Environment.ProcessPath ?? "BluettiWatcher.exe";
+
+    private IReadOnlyList<string> _policyProblems = [];
+
+    /// <summary>The entries of mode <paramref name="modeId"/> the broker policy does not allow; none when there is no policy or no such mode.</summary>
+    public IReadOnlyList<PolicyWarning> PolicyWarnings(string modeId) =>
+        _settings.Modes.FirstOrDefault(m => m.Id == modeId) is { } mode && ReadPolicy() is { } policy
+            ? PolicyWarning.For(mode, registry, policy, ExePath)
+            : [];
+
+    /// <summary>The active mode's policy gaps, re-read each pass; a new set is logged and raised once.</summary>
+    private void CheckPolicy(Mode mode)
+    {
+        IReadOnlyList<string> now = [.. PolicyWarnings(mode.Id).Select(w => w.Text(mode.Id))];
+        if (now.SequenceEqual(_policyProblems, StringComparer.Ordinal)) return;
+        _policyProblems = now;
+        foreach (var text in now)
+        {
+            log($"modes: {text}");
+            onEvent?.Invoke("action-failed", text);
+        }
+    }
+    public bool AutoHibernate => _settings.AutoHibernate;
+    /// <summary>The mode being entered while its actions run; null when no transition is under way.</summary>
+    public string? Switching => _switching;
+    /// <summary>The last change asked for (API or tray): done or not, it is not cut short by the caller that asked.</summary>
+    public Task Pending => Volatile.Read(ref _pending);
+    /// <summary>A change is queued or running.</summary>
+    public bool Busy => !Pending.IsCompleted;
+
+    /// <summary>The service stops: a transition under way stops at its next action.</summary>
+    public void Shutdown()
+    {
+        if (!_lifetime.IsCancellationRequested) _lifetime.Cancel();
+    }
+
+    public void Dispose()
+    {
+        Shutdown();
+        _lifetime.Dispose();
+        _gate.Dispose();
+    }
 
     /// <summary>
     /// Loads the settings and replays the journal before any write. An untrusted journal is moved aside and the start is
@@ -125,7 +176,11 @@ internal sealed class ModesEngine(StationConfig config, ModuleRegistry registry,
             onEvent?.Invoke("mode-changed", $"{mode.Id} ({d.Reason})");
         }
         _reason = d.Reason;
-        await _reconciler.ReconcileAsync(mode, ct);
+        CheckPolicy(mode);
+        bool entering = !string.Equals(_reconciler.Snapshot.ModeId, mode.Id, StringComparison.Ordinal);
+        if (entering) _switching = mode.Id;
+        try { await _reconciler.ReconcileAsync(mode, ct); }
+        finally { if (entering) _switching = null; }
         if (journal.Count > ModeJournal.CompactAbove) CompactJournal();
         if (_emergency || _flagWritten == mode.FlagWord) return;
         string why = await flag.WriteAsync(mode.FlagWord, ct);
@@ -192,7 +247,19 @@ internal sealed class ModesEngine(StationConfig config, ModuleRegistry registry,
     /// Applies <paramref name="change"/> (its error "status:text" refuses it), saves, and reconciles at once so the API
     /// answers with the new statuses.
     /// </summary>
-    private async Task<(int Status, string Error)> ChangeAsync(Func<ModesSettings, (ModesSettings Next, string Error)> change, CancellationToken ct)
+    /// <remarks>
+    /// The change runs on the engine's lifetime, never on <paramref name="ct"/>: a transition stopped half-way leaves the
+    /// machine in the new mode's state while the view still names the old one. <paramref name="ct"/> only ends the
+    /// caller's wait (an HTTP request's limit, a client gone).
+    /// </remarks>
+    private Task<(int Status, string Error)> ChangeAsync(Func<ModesSettings, (ModesSettings Next, string Error)> change, CancellationToken ct)
+    {
+        var run = RunChangeAsync(change, _lifetime.Token);
+        Volatile.Write(ref _pending, run);
+        return run.WaitAsync(ct);
+    }
+
+    private async Task<(int Status, string Error)> RunChangeAsync(Func<ModesSettings, (ModesSettings Next, string Error)> change, CancellationToken ct)
     {
         await _gate.WaitAsync(ct);
         try
@@ -209,6 +276,12 @@ internal sealed class ModesEngine(StationConfig config, ModuleRegistry registry,
             _settings = next;
             await ReconcileAsync(ct);
             return (0, "");
+        }
+        catch (Exception e) when (e is not OperationCanceledException)
+        {
+            // The caller may have stopped waiting (202): the failure is said here, not lost with the task.
+            log($"modes: change failed: {e.GetType().Name}: {e.Message}");
+            throw;
         }
         finally { _gate.Release(); }
     }

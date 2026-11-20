@@ -9,7 +9,7 @@ namespace BluettiWatcher.Modes.Modules;
 /// (an admin or SYSTEM task) goes through the admin broker (<c>task.enable</c>, <c>task.disable</c>). Reversible.
 /// </summary>
 /// <remarks>Pattern: Adapter.</remarks>
-internal sealed class ScheduledTaskModule(ITaskScheduler tasks, IAdminBroker broker) : IActionModule
+internal sealed class ScheduledTaskModule(ITaskScheduler tasks, IAdminBroker broker) : IActionModule, IBrokerTargets
 {
     public const string Id = "scheduledTask.state";
     private const string Prefix = "task/";
@@ -57,6 +57,11 @@ internal sealed class ScheduledTaskModule(ITaskScheduler tasks, IAdminBroker bro
         return problems;
     }
 
+    /// <summary>A task the user may not change (an administrator's or SYSTEM's) is changed by the broker: it needs its policy entry.</summary>
+    public IReadOnlyList<BrokerTarget> BrokerTargets(JsonObject settings) =>
+        [.. JsonFields.Objects(settings["tasks"]).Select(e => JsonFields.Str(e["path"])).OfType<string>().Where(p => p.Length > 0)
+            .Distinct(StringComparer.OrdinalIgnoreCase).Select(p => new BrokerTarget(BrokerTargetKind.Task, p))];
+
     public IReadOnlyList<ResourceIntent> Expand(JsonObject settings) =>
         [.. JsonFields.Objects(settings["tasks"])
             .Select(e => (Path: JsonFields.Str(e["path"]), Enabled: JsonFields.Bool(e["enabled"])))
@@ -81,7 +86,7 @@ internal sealed class ScheduledTaskModule(ITaskScheduler tasks, IAdminBroker bro
         string? direct = await tasks.SetEnabledAsync(path, want, ct);
         if (direct is not null)
         {
-            var r = await broker.RunAsync(want ? "task.enable" : "task.disable", new JsonObject { ["path"] = path }, ct);
+            var r = await broker.RunAsync(want ? "task.enable" : "task.disable", new JsonObject { ["name"] = path }, ct);
             if (!r.Ok) return ApplyResult.Failed($"task '{path}': {direct}; the broker refused or failed: {r.Error}");
         }
         var after = await tasks.ReadEnabledAsync(path, ct);
