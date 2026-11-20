@@ -424,6 +424,16 @@ public sealed class CloudReaderTests : IDisposable
         Assert.DoesNotContain(Refresh, s, StringComparison.Ordinal);
     }
 
+    [Theory]
+    [InlineData(long.MaxValue, 253_402_300_799L)]   // a lifetime past year 9999 ends at the last second there is
+    [InlineData(long.MinValue, 0L)]                 // a lifetime before 1970 has ended
+    [InlineData(3600L, 1_700_003_600L)]
+    public void ExpiresAt_LifetimeOfAnySize_SaturatesInsteadOfOverflowing(long expiresIn, long expectedUnix)
+    {
+        var token = new CloudToken(Access, Refresh, "bearer", expiresIn, 1_700_000_000);
+        Assert.Equal(expectedUnix, token.ExpiresAt.ToUnixTimeSeconds());
+    }
+
     // design.md §4 AC2
     [Fact]
     public async Task A_station_on_battery_is_a_reading_from_the_cloud()
@@ -608,7 +618,7 @@ public sealed class CloudReaderTests : IDisposable
             ? """{"access_token":"NEW-ACCESS","token_type":"bearer","expires_in":2678400}"""
             : $$"""{"access_token":"NEW-ACCESS","refresh_token":"{{refresh}}","token_type":"bearer","expires_in":2678400}""");
 
-    private JsonElement TokenFile() => JsonDocument.Parse(File.ReadAllText(TokenPath)).RootElement;
+    private JsonElement TokenFile() => JsonElement.Parse(File.ReadAllText(TokenPath));
 
     // design.md §4 AC4: early refresh, written atomically, the new token used
     [Fact]

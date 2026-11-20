@@ -1,9 +1,10 @@
 <Project>
   <PropertyGroup>
     <!-- The Windows TFM brings the WinRT projection the native Bluetooth reader uses (Windows.Devices.Bluetooth). -->
-    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
-    <LangVersion>latest</LangVersion>
+    <TargetFramework>net11.0-windows10.0.19041.0</TargetFramework>
     <Nullable>enable</Nullable>
+    <!-- Arithmetic is checked: an overflow throws. Checksums, hashes and deliberate wrap-around sit in unchecked(...). -->
+    <CheckForOverflowUnderflow>true</CheckForOverflowUnderflow>
     <ImplicitUsings>enable</ImplicitUsings>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <AnalysisLevel>latest-all</AnalysisLevel>
