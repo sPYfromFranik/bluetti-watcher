@@ -112,16 +112,29 @@ internal sealed class WinRtBleLink(BluetoothLEDevice device) : IBleLink
 
     public ChannelReader<byte[]> Notifications => _notes.Reader;
 
+    /// <summary>Null when subscribed, otherwise the status. The handler goes on first so no early notification is lost.</summary>
+    private async Task<string?> SubscribeAsync(GattCharacteristic notify, CancellationToken ct)
+    {
+        bool subscribed = false;
+        notify.ValueChanged += OnValueChanged;
+        try
+        {
+            var sub = await notify.WriteClientCharacteristicConfigurationDescriptorAsync(GattClientCharacteristicConfigurationDescriptorValue.Notify).AsTask(ct);
+            subscribed = sub == GattCommunicationStatus.Success;
+            return subscribed ? null : sub.ToString();
+        }
+        finally
+        {
+            if (!subscribed) notify.ValueChanged -= OnValueChanged;
+        }
+    }
+
     /// <summary>Null when the link is ready; otherwise why not.</summary>
     internal async Task<string?> InitAsync(int attempts, Action<string> stage, CancellationToken ct)
     {
-        var found = await GattDiscovery.RunAsync<GattDeviceService, GattCharacteristic>(ServicesAsync, FindAsync, attempts, TimeSpan.FromSeconds(1), stage, ct);
+        var found = await GattDiscovery.RunAsync<GattDeviceService, GattCharacteristic>(ServicesAsync, FindAsync, SubscribeAsync, attempts, TimeSpan.FromSeconds(1), stage, ct);
         if (found is not { Notify: { } notify, Write: { } write }) return found.Failure ?? "the station has no ff01/ff02 characteristic";
         (_notify, _write) = (notify, write);
-        notify.ValueChanged += OnValueChanged;
-        stage(found.Mode == BluetoothCacheMode.Cached ? "the notification subscription (cached characteristics)" : "the notification subscription (uncached characteristics)");
-        var sub = await notify.WriteClientCharacteristicConfigurationDescriptorAsync(GattClientCharacteristicConfigurationDescriptorValue.Notify).AsTask(ct);
-        if (sub != GattCommunicationStatus.Success) return $"notification subscription: {sub}";
         // Windows raises Disconnected during the GATT setup above while the link goes on working: watched only from here on.
         // A link really gone by now ends as a later disconnect does, so none is lost.
         device.ConnectionStatusChanged += OnConnectionStatusChanged;
