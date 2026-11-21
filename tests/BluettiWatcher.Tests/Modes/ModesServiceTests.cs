@@ -61,13 +61,13 @@ public sealed class ModesServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task Poll_MainsBackPastMainsBackSec_RestoresThePlanWithoutTheSwitchOff()
+    public async Task Poll_MainsBackPastMainsBackSec_EndsOnBalancedWithoutTheSwitchOff()
     {
         await Feed(Grid(80), Bat(80), Bat(79), Bat(79), Bat(78));
         await Feed(Grid(78), Grid(79), Grid(79), Grid(80));
 
         Assert.Equal("normal", _engine.Snapshot.ModeId);
-        Assert.Equal("\"high\"", _m.Text("plan"));
+        Assert.Equal("\"381b4222-f694-41f0-9685-ff5bb260df2e\"", _m.Text("plan"));   // Normal ends on Balanced, whatever the plan was before Eco
         Assert.DoesNotContain("off", _actions.Calls);
     }
 
@@ -173,6 +173,47 @@ public sealed class ModesServiceTests : IDisposable
         Assert.DoesNotContain("mode-changed", events);
     }
 
+    private ModesEngine NoticeEngine(string name, List<Tray.TrayNotice> notices)
+    {
+        string sub = Directory.CreateDirectory(Path.Combine(_dir, name)).FullName;
+        var engine = new ModesEngine(new StationConfig { DataDir = sub }, new ModuleRegistry([new FakeModule(BuiltInModes.PowerPlanType, _m)]), new ModesStore(sub),
+            new ModeJournal(Path.Combine(sub, ModeJournal.FileName)), new FakeFlagWriter(), _clock, _ => { },
+            (k, d) => { if (Tray.TrayNotices.FromEvent(k, d, 50) is { } n) notices.Add(n); });
+        engine.Start(T0.AddDays(-1));
+        return engine;
+    }
+
+    // The user picked it (the page's switch, the tray menu, the CLI): he knows, a notification only repeats it.
+    [Fact]
+    public async Task Select_ByTheUser_NoModeChangeNotice()
+    {
+        var notices = new List<Tray.TrayNotice>();
+        using var engine = NoticeEngine("chosen", notices);
+        await engine.StepAsync(new SelectorInput(true, TimeSpan.FromHours(1), 80, null, _clock.GetLocalNow()), emergency: false, TestContext.Current.CancellationToken);
+        notices.Clear();
+
+        await engine.SelectAsync(BuiltInModes.Eco, TestContext.Current.CancellationToken);
+        await engine.Pending;
+
+        Assert.Equal(BuiltInModes.Eco, engine.Snapshot.ModeId);
+        Assert.DoesNotContain(notices, n => n.Kind == Tray.NotificationKind.ModeChanges);
+    }
+
+    // The program switched on its own (an Auto rule): the one notice of the change.
+    [Fact]
+    public async Task Step_AutoRuleSwitches_OneModeChangeNotice()
+    {
+        var notices = new List<Tray.TrayNotice>();
+        using var engine = NoticeEngine("rule", notices);
+        await engine.StepAsync(new SelectorInput(true, TimeSpan.FromHours(1), 80, null, _clock.GetLocalNow()), emergency: false, TestContext.Current.CancellationToken);
+        notices.Clear();
+
+        await engine.StepAsync(new SelectorInput(false, TimeSpan.FromHours(1), 80, null, _clock.GetLocalNow()), emergency: false, TestContext.Current.CancellationToken);
+
+        Assert.Equal(BuiltInModes.Eco, engine.Snapshot.ModeId);
+        Assert.Single(notices, n => n.Kind == Tray.NotificationKind.ModeChanges);
+    }
+
     // The notice is a banner of a few seconds: raised before the actions, it showed while a refresh-rate change had the
     // screens dark.
     [Fact]
@@ -183,7 +224,7 @@ public sealed class ModesServiceTests : IDisposable
         var planAtEvent = new List<string?>();
         using var engine = new ModesEngine(cfg, new ModuleRegistry([new FakeModule(BuiltInModes.PowerPlanType, _m)]), new ModesStore(sub),
             new ModeJournal(Path.Combine(sub, ModeJournal.FileName)), new FakeFlagWriter(), _clock, _ => { },
-            (k, _) => { if (k == "mode-changed") planAtEvent.Add(_m.Text("plan")); });
+            (k, _) => { if (k == ModesEngine.ModeChosenEvent) planAtEvent.Add(_m.Text("plan")); });
         engine.Start(T0.AddDays(-1));
         await engine.StepAsync(new SelectorInput(true, TimeSpan.FromHours(1), 80, null, _clock.GetLocalNow()), emergency: false, TestContext.Current.CancellationToken);
         planAtEvent.Clear();

@@ -76,7 +76,7 @@ var bluetooth = new NativeBleReader(config, new WinRtBleConnector(), Log);
 // Power modes v2 (modes.engine = v2): settings and journal in the data directory; the journal is replayed before any write.
 if (!config.Modes.V2On && !string.Equals(config.Modes.Engine, BluettiWatcher.Modes.ModesConfig.Legacy, StringComparison.OrdinalIgnoreCase))
     Log($"CONFIG - modes.engine \"{config.Modes.Engine}\" is not legacy or v2: legacy is used");
-using var modes = config.Modes.V2On ? new BluettiWatcher.Modes.ModesEngine(config, new BluettiWatcher.Modes.ModuleRegistry(BluettiWatcher.Modes.ModuleCatalog.Production(config, runner, time, store.AddEvent, Log)),
+using var modes = config.Modes.V2On ? new BluettiWatcher.Modes.ModesEngine(config, new BluettiWatcher.Modes.ModuleRegistry(BluettiWatcher.Modes.ModuleCatalog.Production(config, runner, time, Log)),
     new BluettiWatcher.Modes.ModesStore(config.DataDir), new BluettiWatcher.Modes.ModeJournal(Path.Combine(config.DataDir, BluettiWatcher.Modes.ModeJournal.FileName)),
     new BluettiWatcher.Modes.SwitchFlagWordWriter(config, Log), time, Log, (kind, detail) => store.AddEvent(time.GetLocalNow(), kind, detail))
     {
@@ -105,19 +105,20 @@ using var account = new CloudAccount(config, cloud, signInHttp, time, Log, stop.
 var notificationSettings = new NotificationSettingsStore(Path.Combine(config.DataDir, "notifications.json"), Log);
 BluettiWatcher.Modes.Broker.BrokerStatus BrokerState() => BluettiWatcher.Modes.Broker.BrokerVersion.Check(typeof(StationService).Assembly.GetName().Version ?? new Version(0, 0),
     BluettiWatcher.Modes.Broker.BrokerVersion.Read(BluettiWatcher.Modes.Broker.BrokerPaths.Default));
-var pageSettings = new PageSettingsStore(Path.Combine(config.DataDir, PageSettingsStore.FileName), Log);
+// The catalogue's discovery takes seconds: built at start, so the page's first ask is answered at once.
+var modesApi = modes is null ? null : new ModesApi(config, modes);
+modesApi?.WarmCatalogue();
 var api = new StationApi(config, service, store, time, started, dtek, Log, () => bluetooth.StationEncrypted, () => bluetooth.BluetoothStalled,
         () =>
         {
             using var planSwitch = new BluettiWatcher.PowerMode.PowerModeSwitch([.. BluettiWatcher.PowerMode.PowerModeSwitch.ProcessEnvironment(), .. config.PowerModeEnvironment], TextWriter.Null);
             return planSwitch.ActivePlan();
-        }, account, bluetooth.StationBlocks, modes is null ? null : new ModesApi(config, modes), notificationSettings, BrokerState,
-    pageSettings);
+        }, account, bluetooth.StationBlocks, modesApi, notificationSettings, BrokerState);
 // The notification-area icon and the notifications: a thread of this process, only in an interactive session (README, Tray).
 using var trayHost = config.Tray && Environment.UserInteractive
-    ? TrayHost.Start(modes is null ? new ManualTrayModes(service) : new ModesTrayModes(modes), new Uri($"http://127.0.0.1:{config.Port}/"), time.LocalTimeZone, () => TrayWords.For(pageSettings.Lang), Log)
+    ? TrayHost.Start(modes is null ? new ManualTrayModes(service) : new ModesTrayModes(modes), new Uri($"http://127.0.0.1:{config.Port}/"), time.LocalTimeZone, Log)
     : null;
-var tray = trayHost is null ? null : new TrayController(trayHost, notificationSettings, () => TrayWords.For(pageSettings.Lang));
+var tray = trayHost is null ? null : new TrayController(trayHost, notificationSettings);
 if (tray is not null) store.EventAdded = tray.OnEvent;
 api.SendTestNotice = tray is null ? null : tray.SendTest;
 void ShowTray()

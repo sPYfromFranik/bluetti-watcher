@@ -6,6 +6,46 @@ The release notes on GitHub are this file's section for the tag.
 
 ## [Unreleased]
 
+## [1.10.6] - 2026-11-21
+
+### Changed
+
+- Page: the 1.10.5 page redesign is withdrawn. The page is the 1.10.4 page again (every card, chart, the battery ring
+  and the layout), with the text and element fixes below. With it, tray and Windows notifications are in English again,
+  and `GET/PUT /api/settings/page` and `page-settings.json` are gone.
+- Page texts: no middle dots or text arrows between facts. The header names the mains state in one chip ("On battery",
+  "Charging 300 W", "Grid on") and the plan in force by its name; mode and action names come in the page's language,
+  day counts with their plural forms, the broker's failure and its next try in local time. The 30-day tiles share one
+  baseline.
+- Power modes panel: each mode is plain lines worded from its actions with one "Set up" button; the usual Auto pair
+  reads as one sentence with the minutes editable ("More rules" opens the full list); only what failed is shown. The
+  panel has no mode switch of its own: the header's is the one. The mode editor opens in place.
+- Mode editor: the GPU limit is one choice, the card's lowest limit or watts of your own, stepped by 10 within the
+  card's range, with the range and the usual limit as a hint; a saved percent shows in watts and is kept until edited.
+  Each action block has its title, Remove and an on switch in its header. No browser checkboxes, no asterisks, no list
+  of one choice; field names and values in the page's language.
+- Page: a Settings card above the reading source holds "Hibernate on low battery", "Notifications" (all on or off;
+  "Set up" switches each group) and the test notification. They left the folded Power modes panel.
+- Notifications: a mode you pick yourself (the page, the tray, the command line, an edit) shows no notification. Its
+  event is `mode-chosen`; a switch the service makes on its own stays `mode-changed`.
+- Notifications: `notifications.json` and `/api/settings/notifications` take `enabled`, a switch over every group that
+  keeps each group's own value.
+- Power modes: a fresh install's Normal sets the Balanced plan, so leaving Eco ends on Balanced even after a hand change
+  during Eco. A saved mode is not rewritten.
+- API: the action catalogue (`GET /api/modes/catalogue`) is built at start; an ask is answered from the last build at
+  once while one rebuild runs behind it. The page asks for it at load, so a mode block paints once, with its lines. A
+  GPU's discovery item gives its `min`, `max` and `default` watts as `numbers`.
+
+### Removed
+
+- The `gpu.idleWatcher` action, which only logged what kept an idle GPU at full clock. A saved mode or journal entry of
+  it is dropped at start with one log line; the event `gpu-idle-p0` is no longer written.
+
+### Fixed
+
+- Page: the mode editor's "[object Object]" fix of 1.10.5 is kept: a list of objects is edited as rows and saving with
+  nothing changed writes the same settings back.
+- Page: a mode block no longer shows bare action names for a few seconds before its lines.
 ## [1.10.5] - 2026-11-21
 
 ### Changed
