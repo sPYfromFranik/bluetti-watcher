@@ -130,6 +130,8 @@ internal sealed class DtekLate
 internal sealed class DtekSnapshot
 {
     public DtekSchedule? Schedule { get; set; }
+    /// <summary>The latest accepted version of every schedule day, up to 30 days back. A changed day replaces its old version.</summary>
+    public List<DtekDay> History { get; set; } = [];
     public DtekHouse? House { get; set; }
     public DtekMatch Match { get; set; } = new();
     public DtekHint Hint { get; set; } = new();
@@ -165,6 +167,7 @@ internal sealed class DtekSnapshot
         s.DatasetDetail = DtekParser.Clean(s.DatasetDetail, MaxDetail);
         s.SiteDetail = DtekParser.Clean(s.SiteDetail, MaxDetail);
         s.Schedule = Sound(s.Schedule);
+        s.History = SoundHistory(s.History);
         if (s.OpenCut is { } cut)
         {
             cut.Held = Sound(cut.Held);
@@ -197,6 +200,20 @@ internal sealed class DtekSnapshot
         if (!sound) return null;
         sc.Days.Sort((a, b) => a.Start.CompareTo(b.Start));
         return sc;
+    }
+
+    private static List<DtekDay> SoundHistory(List<DtekDay>? days)
+    {
+        var sound = new List<DtekDay>();
+        foreach (var d in days ?? [])
+        {
+            if (d is not { Start: >= 0 and <= DtekTime.MaxDayStart, Queues: { Count: > 0 and <= DtekTime.MaxQueues } q }
+                || !q.All(kv => kv.Key is { Length: > 0 and <= MaxName } && kv.Value is { Length: 24 })) continue;
+            int old = sound.FindIndex(x => x.Start == d.Start);
+            if (old >= 0) sound[old] = d; else sound.Add(d);
+        }
+        sound.Sort((a, b) => a.Start.CompareTo(b.Start));
+        return sound;
     }
 }
 

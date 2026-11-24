@@ -16,4 +16,14 @@ internal interface IDtekWatcher : IDisposable
 
     /// <summary>The module's object for /api/now. <paramref name="hoursToHibernate"/>: the battery estimate down to the hibernate level, null = unknown.</summary>
     DtekView View(bool cut, double? hoursLeft, double? hoursToHibernate = null);
+
+    DtekEndpointSettings EndpointSettings() => new("", null, "");
+
+    /// <summary>Saves a new public endpoint. Empty disables reads. Returns the validation/storage error, or null.</summary>
+    string? SetEndpoint(string url) => "endpoint settings are unavailable";
+
+    /// <summary>Makes the background loop read the endpoint now.</summary>
+    void Refresh() { }
 }
+
+internal sealed record DtekEndpointSettings(string Url, DateTimeOffset? TriedAt, string Error);

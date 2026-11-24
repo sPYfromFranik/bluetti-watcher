@@ -6,6 +6,15 @@ The release notes on GitHub are this file's section for the tag.
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-11-24
+
+### Added
+
+- Planned outage schedules can be configured from the page with a public HTTPS JSON endpoint, refreshed manually or
+  automatically every 30 minutes. The latest version of each date replaces the previous one and is retained for 30 days.
+- The dashboard has a compact planned-outage card, a striped planned-outage overlay on the history chart, and a battery
+  forecast that estimates the charge remaining at the planned return or identifies an unplanned outage.
+
 ## [1.10.6] - 2026-11-21
 
 ### Changed

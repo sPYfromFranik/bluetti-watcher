@@ -9,6 +9,10 @@ namespace BluettiWatcher.DtekWatcher;
 /// </summary>
 internal sealed class DtekConfig
 {
+    /// <summary>The desktop page may enable the module after startup. Host-only; never part of config.json.</summary>
+    [JsonIgnore]
+    internal bool Dynamic { get; set; }
+
     public const string DefaultHost = "www.dtek-krem.com.ua";
     public const string DefaultDatasetUrl = "https://raw.githubusercontent.com/Baskerville42/outage-data-ua/main/data/kyiv-region.json";
 

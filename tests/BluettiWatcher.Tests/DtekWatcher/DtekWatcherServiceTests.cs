@@ -53,6 +53,29 @@ public sealed class DtekWatcherServiceTests : IDisposable
         return c;
     }
 
+    [Fact]
+    public async Task An_endpoint_saves_successfully_and_its_queue_survives_restart()
+    {
+        var cfg = new StationConfig { DataDir = _dir };
+        var store = new DtekStore(_store);
+        DtekWatcherService? watcher = null;
+        using var guard = new DtekWatcherGuard(cfg, store, _clock, _ => { },
+            () => watcher = new DtekWatcherService(cfg, () => _source, store, _clock, _ => { }));
+        Assert.Null(guard.SetEndpoint("https://data.example/schedule?queue=4.1"));
+        var schedule = DtekParser.ParseDataset("""
+            [{"eventDate":"07.10.2026","queues":{"4.1":[{"from":"17:00","to":"19:00","status":1}]}}]
+            """, null).Schedule!;
+        schedule.CollectedAt = _clock.GetUtcNow();
+        _source.Datasets.Enqueue(FakeSource.Data(schedule));
+        Assert.True(await watcher!.TickAsync(CancellationToken.None));
+        Assert.Equal("4.1", guard.View(false, null).Queue);
+
+        using var restarted = Watcher(new DtekConfig());
+        var view = restarted.View(false, null);
+        Assert.Equal("4.1", view.Queue);
+        Assert.Equal(At("2026-10-07 17:00"), view.NextStart);
+    }
+
     // design.md §11 DTEK module, rule 8
     [Fact]
     public async Task Disabled_makes_no_source_and_no_request()

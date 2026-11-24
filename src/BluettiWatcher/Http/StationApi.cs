@@ -70,6 +70,7 @@ internal sealed partial class StationApi(StationConfig config, StationService se
         if (await CloudRouteAsync(r, ct) is { } cloudAnswer) return cloudAnswer;
         if (r.Path == Tray.NotificationSettingsApi.Route && notificationSettings is not null) return Tray.NotificationSettingsApi.Handle(r, notificationSettings, config.Port);
         if (r.Path == Tray.NotificationSettingsApi.TestRoute) return Tray.NotificationSettingsApi.HandleTest(r, SendTestNotice, config.Port);
+        if (r.Path is "/api/outage-schedule" or "/api/outage-schedule/refresh") return OutageSchedule(r);
         if (r.Method != "GET") return HttpResponse.Text(405, "GET only");
         // /api/now?settle=1: answers once the saved page choice is applied, refused or failed (bounded under the server's 10 s).
         // Both waits count against the time left in the request, so a request that started late still answers in time.
@@ -85,6 +86,43 @@ internal sealed partial class StationApi(StationConfig config, StationService se
             "/api/return-plan" => HttpResponse.Json(200, Write(w => { w.WriteStartObject(); w.WriteString("returnPlan", ReturnPlanFile.Read(config.FlagFile)); w.WriteEndObject(); })),
             _ => HttpResponse.Text(404, "not found"),
         };
+    }
+
+    private HttpResponse OutageSchedule(HttpRequest r)
+    {
+        if (dtek is null) return HttpResponse.Text(409, "the outage schedule module is unavailable");
+        if (r.Method == "GET" && r.Path == "/api/outage-schedule") return OutageSettings();
+        if (r.Method == "POST" && r.Path == "/api/outage-schedule/refresh")
+        {
+            if (RequestGuard.WriteRefusal(r, config.Port) is { } why) return HttpResponse.Text(403, "forbidden: " + why);
+            dtek.Refresh();
+            return HttpResponse.Json(202, Write(w => { w.WriteStartObject(); w.WriteBoolean("accepted", true); w.WriteEndObject(); }));
+        }
+        if (r.Method != "PUT" || r.Path != "/api/outage-schedule") return HttpResponse.Text(405, "GET or PUT; refresh is POST");
+        if (RequestGuard.WriteRefusal(r, config.Port) is { } refusal) return HttpResponse.Text(403, "forbidden: " + refusal);
+        string? url;
+        try
+        {
+            using var doc = JsonDocument.Parse(r.Body);
+            url = doc.RootElement.ValueKind == JsonValueKind.Object && doc.RootElement.TryGetProperty("url", out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() : null;
+        }
+        catch (JsonException) { return HttpResponse.Text(400, "body must be JSON { \"url\": \"https://...\" }"); }
+        if (url is null) return HttpResponse.Text(400, "url must be a string");
+        if (dtek.SetEndpoint(url) is { } error) return HttpResponse.Text(400, error);
+        return OutageSettings();
+    }
+
+    private HttpResponse OutageSettings()
+    {
+        var settings = dtek!.EndpointSettings();
+        return HttpResponse.Json(200, Write(w =>
+        {
+            w.WriteStartObject();
+            w.WriteString("url", settings.Url);
+            Time(w, "triedAt", settings.TriedAt);
+            w.WriteString("error", settings.Error);
+            w.WriteEndObject();
+        }));
     }
 
     /// <summary>ISO 8601 or Unix milliseconds; null when absent; throws FormatException when unreadable.</summary>
@@ -669,6 +707,17 @@ internal sealed partial class StationApi(StationConfig config, StationService se
         Time(w, "nextEnd", v.NextEnd);
         w.WriteString("nextQueue", v.NextQueue);
         Strings(w, "nextQueues", v.NextQueues);
+        w.WriteBoolean("expectsMainsNow", v.ExpectsMainsNow);
+        w.WriteStartArray("planned");
+        foreach (var p in v.Planned)
+        {
+            w.WriteStartObject();
+            w.WriteString("start", Iso(p.Start));
+            w.WriteString("end", Iso(p.End));
+            Strings(w, "queues", p.Queues);
+            w.WriteEndObject();
+        }
+        w.WriteEndArray();
         Time(w, "return", v.Return);
         w.WriteString("outageKind", v.OutageKind);
         w.WriteString("outageStart", v.OutageStart);

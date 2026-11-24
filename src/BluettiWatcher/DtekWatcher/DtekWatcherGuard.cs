@@ -130,4 +130,22 @@ internal sealed class DtekWatcherGuard : IDtekWatcher
             return DtekView.Broken(new PageNote(PageCodes.DtekModuleError, $"module error: {e.GetType().Name}", e.GetType().Name));
         }
     }
+
+    public DtekEndpointSettings EndpointSettings()
+    {
+        try { return _inner?.EndpointSettings() ?? new("", null, "module did not start"); }
+        catch (Exception e) when (e is not OperationCanceledException) { Fault("endpoint settings", e); return new("", null, e.GetType().Name); }
+    }
+
+    public string? SetEndpoint(string url)
+    {
+        try { return _inner is null ? "module did not start" : _inner.SetEndpoint(url); }
+        catch (Exception e) when (e is not OperationCanceledException) { Fault("set endpoint", e); return e.Message; }
+    }
+
+    public void Refresh()
+    {
+        try { _inner?.Refresh(); }
+        catch (Exception e) when (e is not OperationCanceledException) { Fault("refresh", e); }
+    }
 }

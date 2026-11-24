@@ -19,6 +19,13 @@ internal static class DtekParser
     /// <summary>A queue name as the distributor writes it: GPV, one or two digits, a dot, one or two digits.</summary>
     public static bool IsQueue(string? name)
     {
+        if (name is { Length: >= 3 and <= 5 })
+        {
+            int simpleDot = name.IndexOf('.', StringComparison.Ordinal);
+            if (simpleDot is 1 or 2 && name.Length - simpleDot - 1 is 1 or 2
+                && name.AsSpan(0, simpleDot).IndexOfAnyExceptInRange('0', '9') < 0
+                && name.AsSpan(simpleDot + 1).IndexOfAnyExceptInRange('0', '9') < 0) return true;
+        }
         if (name is not { Length: >= 6 and <= 8 } || !name.StartsWith("GPV", StringComparison.Ordinal)) return false;
         int dot = name.IndexOf('.', StringComparison.Ordinal);
         return dot is 4 or 5 && name.Length - dot - 1 is 1 or 2 && name.AsSpan(3, dot - 3).IndexOfAnyExceptInRange('0', '9') < 0 && name.AsSpan(dot + 1).IndexOfAnyExceptInRange('0', '9') < 0;
@@ -155,6 +162,7 @@ internal static class DtekParser
         using (doc)
         {
             var root = doc.RootElement;
+            if (root.ValueKind == JsonValueKind.Array) return ParseOpenEndpoint(root, etag);
             if (root.ValueKind != JsonValueKind.Object || !root.TryGetProperty("fact", out var fact) || ScheduleOf(fact, "dataset") is not { } schedule)
                 return new(DtekStatus.Format, null, null, false, "the dataset has no fact of the expected shape");
             if (!root.TryGetProperty("lastUpdated", out var at) || at.ValueKind != JsonValueKind.String || !at.TryGetDateTimeOffset(out var collected))
@@ -162,6 +170,68 @@ internal static class DtekParser
             schedule.CollectedAt = collected;
             return new(DtekStatus.Ok, schedule, etag, false, "");
         }
+    }
+
+    /// <summary>The user-configured open endpoint: [{ eventDate:"dd.MM.yyyy", queues:{ "4.1":[{from,to,status:1}] } }].</summary>
+    private static DtekDatasetResult ParseOpenEndpoint(JsonElement root, string? etag)
+    {
+        try
+        {
+            var schedule = new DtekSchedule { Source = "endpoint", CollectedAt = DateTimeOffset.UtcNow };
+            DateTimeOffset? newest = null;
+            foreach (var item in root.EnumerateArray())
+            {
+                if (schedule.Days.Count >= DtekTime.MaxDays || item.ValueKind != JsonValueKind.Object
+                    || !item.TryGetProperty("eventDate", out var dateValue) || dateValue.ValueKind != JsonValueKind.String
+                    || !DateTime.TryParseExact(dateValue.GetString(), "dd.MM.yyyy", CultureInfo.InvariantCulture, DateTimeStyles.None, out var date)
+                    || !item.TryGetProperty("queues", out var queues) || queues.ValueKind != JsonValueKind.Object)
+                    return new(DtekStatus.Format, null, null, false, "the endpoint has an invalid eventDate or queues object");
+                var day = new DtekDay { Start = DtekTime.Resolve(date.Date, DtekTime.Kyiv, true).ToUnixTimeSeconds() };
+                foreach (var queue in queues.EnumerateObject())
+                {
+                    if (!IsQueue(queue.Name) || queue.Value.ValueKind != JsonValueKind.Array || day.Queues.Count >= MaxQueues)
+                        return new(DtekStatus.Format, null, null, false, "the endpoint has an invalid queue");
+                    var off = new bool[48];
+                    foreach (var window in queue.Value.EnumerateArray())
+                    {
+                        if (window.ValueKind != JsonValueKind.Object) return new(DtekStatus.Format, null, null, false, "the endpoint has an invalid outage window");
+                        if (window.TryGetProperty("status", out var status) && status.ValueKind == JsonValueKind.Number && status.TryGetInt32(out int code) && code != 1) continue;
+                        string? from = window.TryGetProperty("from", out var f) && f.ValueKind == JsonValueKind.String ? f.GetString() : null;
+                        string? to = window.TryGetProperty("to", out var t) && t.ValueKind == JsonValueKind.String ? t.GetString() : null;
+                        if (!HalfHour(from, out int a) || !HalfHour(to, out int b)) return new(DtekStatus.Format, null, null, false, "outage times must be HH:mm on a half hour");
+                        if (b == 0 && a > 0) b = 48;
+                        if (b <= a) return new(DtekStatus.Format, null, null, false, "an outage window must end after it starts");
+                        for (int k = a; k < b; k++) off[k] = true;
+                    }
+                    day.Queues[queue.Name] = string.Create(24, off, static (cells, slots) =>
+                    {
+                        for (int h = 0; h < 24; h++) cells[h] = (slots[h * 2], slots[h * 2 + 1]) switch
+                        {
+                            (true, true) => '0', (true, false) => 'f', (false, true) => 's', _ => '1',
+                        };
+                    });
+                }
+                if (day.Queues.Count == 0) return new(DtekStatus.Format, null, null, false, "the endpoint day has no queues");
+                int old = schedule.Days.FindIndex(d => d.Start == day.Start);
+                if (old >= 0) schedule.Days[old] = day; else schedule.Days.Add(day);
+                foreach (string field in new[] { "scheduleApprovedSince", "createdAt" })
+                    if (item.TryGetProperty(field, out var stamp) && stamp.ValueKind == JsonValueKind.String && stamp.GetString() is { } text && ParseDate(text, DtekTime.Kyiv) is { } at && (newest is null || at > newest)) newest = at;
+            }
+            if (schedule.Days.Count == 0) return new(DtekStatus.Format, null, null, false, "the endpoint returned no schedule days");
+            schedule.Days.Sort((a, b) => a.Start.CompareTo(b.Start));
+            schedule.UpdateAt = newest;
+            schedule.Update = newest is { } u ? u.ToString("dd.MM.yyyy HH:mm", CultureInfo.InvariantCulture) : "";
+            return new(DtekStatus.Ok, schedule, etag, false, "");
+        }
+        catch (InvalidOperationException) { return new(DtekStatus.Format, null, null, false, "the endpoint response has invalid text"); }
+    }
+
+    private static bool HalfHour(string? text, out int slot)
+    {
+        slot = 0;
+        if (!TimeOnly.TryParseExact(text, "HH:mm", CultureInfo.InvariantCulture, DateTimeStyles.None, out var value) || value.Minute % 30 != 0) return false;
+        slot = value.Hour * 2 + value.Minute / 30;
+        return true;
     }
 
     /// <summary>24 characters, one per hour; an hour that is missing or not a known word is <c>?</c>.</summary>
