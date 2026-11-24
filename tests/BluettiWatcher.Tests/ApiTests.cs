@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
+using BluettiWatcher.DtekWatcher;
 using BluettiWatcher.Http;
 using BluettiWatcher.Storage;
 using static BluettiWatcher.Tests.Fx;
@@ -10,6 +11,18 @@ namespace BluettiWatcher.Tests;
 
 public sealed class ApiTests : IDisposable
 {
+    private sealed class EndpointWatcher : IDtekWatcher
+    {
+        public string Url { get; private set; } = "https://data.example/schedule.json";
+        public bool Refreshed { get; private set; }
+        public void Dispose() { }
+        public Task RunAsync(CancellationToken ct) => Task.CompletedTask;
+        public void AfterPoll(BluettiWatcher.Decision.StationState state) { }
+        public DtekView View(bool cut, double? hoursLeft, double? hoursToHibernate = null) => DtekView.Off();
+        public DtekEndpointSettings EndpointSettings() => new(Url, null, "");
+        public string? SetEndpoint(string url) { Url = url; return null; }
+        public void Refresh() => Refreshed = true;
+    }
     private const int Port = 18940;
     private readonly string _dir = Path.Combine(Path.GetTempPath(), "bluetti-watcher-test-" + Guid.NewGuid().ToString("N"));
     private readonly StationStore _store;
@@ -49,6 +62,20 @@ public sealed class ApiTests : IDisposable
     private static readonly (string, string) XStation = ("X-Station", "1");
 
     private Task<HttpResponse> Post(params (string, string)[] headers) => _api.HandleAsync(Req("POST", "/api/mode", Eco, headers), CancellationToken.None);
+
+    [Fact]
+    public async Task Outage_endpoint_settings_are_guarded_saved_and_refreshed()
+    {
+        using var watcher = new EndpointWatcher();
+        var cfg = new StationConfig { DataDir = _dir, Port = Port };
+        var api = new StationApi(cfg, _service, _store, new ManualClock(T0), T0, watcher);
+
+        Assert.Equal(403, (await api.HandleAsync(Req("PUT", "/api/outage-schedule", "{\"url\":\"https://new.example/s.json\"}", Host), CancellationToken.None)).Status);
+        Assert.Equal(200, (await api.HandleAsync(Req("PUT", "/api/outage-schedule", "{\"url\":\"https://new.example/s.json\"}", Host, XStation), CancellationToken.None)).Status);
+        Assert.Equal("https://new.example/s.json", watcher.Url);
+        Assert.Equal(202, (await api.HandleAsync(Req("POST", "/api/outage-schedule/refresh", null, Host, XStation), CancellationToken.None)).Status);
+        Assert.True(watcher.Refreshed);
+    }
 
     // api.md Guard
     [Fact]

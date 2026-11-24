@@ -28,6 +28,9 @@ internal sealed record DtekView(
     string OutageKind, string OutageStart, string OutageEnd, DateTimeOffset? OutageEndAt, string? BatteryLasts,
     string Today, string Tomorrow, IReadOnlyList<DtekQueueDays> Windows)
 {
+    /// <summary>Planned outage windows retained for the chart, oldest first (at most 30 days).</summary>
+    public IReadOnlyList<DtekInterval> Planned { get; init; } = [];
+    public bool ExpectsMainsNow { get; init; }
     /// <summary>During a cut: the planned window it belonged to has ended and no window covers now (design.md §11 rule 24).</summary>
     public bool Overdue { get; init; }
     /// <summary>Whole minutes since that window's end while overdue, else null.</summary>
@@ -71,6 +74,8 @@ internal static class DtekOutlook
     {
         string[] configured = [.. (config.Queues ?? []).Where(q => !string.IsNullOrWhiteSpace(q)).Select(q => q.Trim()).Distinct(StringComparer.Ordinal)];
         if (configured.Length > 0) return (configured, "config");
+        if (snap.Schedule is { Source: "endpoint" } schedule)
+            return ([.. schedule.Days.SelectMany(d => d.Queues.Keys).Distinct(StringComparer.Ordinal)], "endpoint");
         return snap.House is { Queues.Length: > 0 } h ? (h.Queues, "site") : ([], "");
     }
 
@@ -171,6 +176,9 @@ internal static class DtekOutlook
         IReadOnlyList<string> nextQueues = [];
         var days = new List<DtekQueueDays>();
         var today = TimeZoneInfo.ConvertTime(now, tz).Date;
+        var wall = TimeZoneInfo.ConvertTime(now, tz);
+        var currentDay = schedule?.Days.Find(d => DtekTime.DateOf(d.Start, tz) == today);
+        int slot = wall.Hour * 2 + wall.Minute / 30;
         if (schedule is not null)
         {
             foreach (var q in shown)
@@ -216,6 +224,8 @@ internal static class DtekOutlook
             h?.Kind ?? "", outageStartAt is { } os ? Stamp(os, tz) : h?.StartText ?? "", outageEndAt is { } oe ? Stamp(oe, tz) : h?.EndText ?? "", outageEndAt, lasts,
             Day(today), Day(today.AddDays(1)), days)
         {
+            Planned = HistoryIntervals(snap.History, shown, now, tz),
+            ExpectsMainsNow = currentDay is not null && shown.All(q => DtekTime.Slots(currentDay, q)?[slot] == DtekSlot.On),
             Notes = notes,
             Overdue = overdueMin is not null,
             OverdueMin = overdueMin,
@@ -227,6 +237,19 @@ internal static class DtekOutlook
             QueueSet = MembersOf(queue),
             NextQueues = nextQueues,
         };
+    }
+
+    private static IReadOnlyList<DtekInterval> HistoryIntervals(List<DtekDay> history, IReadOnlyList<string> shown, DateTimeOffset now, TimeZoneInfo tz)
+    {
+        if (history.Count == 0 || shown.Count == 0) return [];
+        var cutoff = now.AddDays(-30);
+        var schedule = new DtekSchedule { Days = [.. history] };
+        var result = new List<DtekInterval>();
+        foreach (var q in shown)
+            result.AddRange(DtekTime.Windows(schedule, q, DtekSlot.Off, tz)
+                .Where(w => w.End > cutoff && w.Start < now.AddDays(8))
+                .Select(w => new DtekInterval(w.Start, w.End, From(schedule, q, w, tz))));
+        return [.. result.OrderBy(x => x.Start).ThenBy(x => x.End)];
     }
 
     private static double? Bounded(double? h) => h is { } raw && double.IsFinite(raw) && raw >= 0 ? Math.Min(raw, MaxHours) : null;

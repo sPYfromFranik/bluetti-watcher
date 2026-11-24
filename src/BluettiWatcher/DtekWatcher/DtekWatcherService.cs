@@ -27,13 +27,15 @@ internal sealed class DtekWatcherService(StationConfig config, Func<IDtekSource>
     private static readonly TimeSpan Wake = TimeSpan.FromSeconds(60);
     private const string MetaKey = "dtekWatcher";
     private const string LateKey = "dtekWatcherLateness";
+    private const string EndpointKey = "plannedOutageEndpoint";
 
     private readonly Lock _lock = new();
     private readonly TimeZoneInfo _tz = DtekTime.Kyiv;
     private readonly Dictionary<string, DateTimeOffset> _changedAt = [];
     private readonly Dictionary<string, (DateTimeOffset FailedAt, bool OwesOk)> _streaks = [];
-    private DtekSnapshot _snap = Load(config.DtekWatcher, store, log);
+    private DtekSnapshot _snap = LoadConfigured(config.DtekWatcher, store, log);
     private IDtekSource? _source;
+    private readonly SemaphoreSlim _wakeNow = new(0, 1);
     private bool _cut;
     private bool _unsaved;
     private bool _lateUnsaved;
@@ -44,7 +46,26 @@ internal sealed class DtekWatcherService(StationConfig config, Func<IDtekSource>
 
     public bool Enabled => Cfg.Enabled && Cfg.Problem() is null;
 
-    public void Dispose() => _source?.Dispose();
+    public void Dispose()
+    {
+        _source?.Dispose();
+        _wakeNow.Dispose();
+    }
+
+    private static DtekSnapshot LoadConfigured(DtekConfig cfg, IDtekStore store, Action<string> log)
+    {
+        try
+        {
+            if (store.GetMeta(EndpointKey) is { Length: > 0 } url)
+            {
+                cfg.DatasetUrl = url;
+                cfg.Enabled = true;
+                cfg.Site = false;
+            }
+        }
+        catch (Exception e) when (e is not OperationCanceledException) { log($"planned outage endpoint not read: {e.GetType().Name}"); }
+        return Load(cfg, store, log);
+    }
 
     /// <summary>
     /// The saved state; anything wrong with the row (unreadable store, damaged or wrong-typed JSON) starts fresh. What was
@@ -116,15 +137,18 @@ internal sealed class DtekWatcherService(StationConfig config, Func<IDtekSource>
     /// <summary>The loop: one look a minute, a read only when one is due. Ends with the token; returns at once when off.</summary>
     public async Task RunAsync(CancellationToken ct)
     {
-        if (!Cfg.Enabled) return;
-        if (Cfg.Problem() is { } problem) { log($"dtek watcher: off - {problem}"); return; }
+        if (!Cfg.Enabled && !Cfg.Dynamic) return;
+        if (Cfg.Enabled && Cfg.Problem() is { } initialProblem && !Cfg.Dynamic) { log($"dtek watcher: off - {initialProblem}"); return; }
         try
         {
             while (!ct.IsCancellationRequested)
             {
-                try { await TickAsync(ct); }
+                try
+                {
+                    if (Cfg.Enabled && Cfg.Problem() is null) await TickAsync(ct);
+                }
                 catch (Exception e) when (e is not OperationCanceledException) { log($"dtek watcher: read failed: {e.GetType().Name}: {e.Message}"); }
-                await Task.Delay(Wake, time, ct);
+                await _wakeNow.WaitAsync(Wake, ct);
             }
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -233,9 +257,18 @@ internal sealed class DtekWatcherService(StationConfig config, Func<IDtekSource>
                 if (theirs == mine && candidate.CollectedAt <= current.CollectedAt) return;   // nothing newer by either time
             }
         }
+        _snap.Schedule = candidate;
         var all = DtekOutlook.Moved(current, candidate, DtekOutlook.Shown(Cfg, _snap), _tz);
         var moved = all.Where(m => Due(_changedAt.GetValueOrDefault(m.Key, DateTimeOffset.MinValue), now, ChangedEvery)).ToList();
-        _snap.Schedule = candidate;   // the schedule in use only: no history
+        // A date has one current version. The next response replaces it in place; old and unrelated dates remain.
+        foreach (var day in candidate.Days)
+        {
+            int old = _snap.History.FindIndex(d => DtekTime.DateOf(d.Start, _tz) == DtekTime.DateOf(day.Start, _tz));
+            if (old >= 0) _snap.History[old] = day; else _snap.History.Add(day);
+        }
+        var cutoff = TimeZoneInfo.ConvertTime(now, _tz).Date.AddDays(-30);
+        _snap.History.RemoveAll(d => DtekTime.DateOf(d.Start, _tz) < cutoff);
+        _snap.History.Sort((a, b) => a.Start.CompareTo(b.Start));
         // Every moved plan during a cut counts, the ones the event's 10 minutes hold back too.
         if (all.Count > 0 && _snap.OpenCut is { PlanChanges: < DtekOpenCut.MaxPlanChanges } open) open.PlanChanges++;
         if (moved.Count == 0) return;
@@ -394,6 +427,54 @@ internal sealed class DtekWatcherService(StationConfig config, Func<IDtekSource>
 
     /// <summary>The queue search as saved, for tests.</summary>
     internal DtekMatch Match { get { lock (_lock) return _snap.Match; } }
+
+    public DtekEndpointSettings EndpointSettings()
+    {
+        lock (_lock) return new(Cfg.Enabled ? Cfg.DatasetUrl : "", _snap.DatasetTriedAt, _snap.DatasetDetail);
+    }
+
+    public string? SetEndpoint(string url)
+    {
+        url = (url ?? "").Trim();
+        if (url.Length > 2048) return "URL is too long";
+        if (url.Length > 0 && !(Uri.TryCreate(url, UriKind.Absolute, out var uri) && uri.Scheme == Uri.UriSchemeHttps && uri.IsDefaultPort && uri.UserInfo.Length == 0))
+            return "URL must be a plain HTTPS address";
+        lock (_lock)
+        {
+            try { store.SetMeta(EndpointKey, url); }
+            catch (Exception e) when (e is not OperationCanceledException) { return $"endpoint was not saved: {e.Message}"; }
+            _source?.Dispose();
+            _source = null;
+            Cfg.DatasetUrl = url.Length > 0 ? url : DtekConfig.DefaultDatasetUrl;
+            Cfg.Enabled = url.Length > 0;
+            Cfg.Site = false;
+            Cfg.Queues = null;
+            _snap.DatasetTriedAt = null;
+            _snap.DatasetETag = null;
+            _snap.DatasetError = "";
+            _snap.DatasetDetail = "";
+            if (url.Length == 0) _snap.Schedule = null;
+            Save();
+        }
+        WakeNow();
+        return null;
+    }
+
+    public void Refresh()
+    {
+        lock (_lock)
+        {
+            _snap.DatasetTriedAt = null;
+            _snap.DatasetETag = null;
+        }
+        WakeNow();
+    }
+
+    private void WakeNow()
+    {
+        try { _wakeNow.Release(); }
+        catch (SemaphoreFullException) { }
+    }
 
     /// <summary>Challenge answers of the site in a row, for tests.</summary>
     internal int SiteBlocked { get { lock (_lock) return _snap.SiteBlocked; } }

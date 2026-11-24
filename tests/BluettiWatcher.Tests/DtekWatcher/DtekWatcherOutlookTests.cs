@@ -17,6 +17,18 @@ public sealed class DtekWatcherOutlookTests
     private static DtekView View(DtekSnapshot snap, string now, bool cut = false, double? hoursLeft = null, DtekConfig? config = null) =>
         DtekOutlook.Compute(config ?? Config(), snap, cut, hoursLeft, new ManualClock(At(now)), Kyiv);
 
+    [Theory]
+    [InlineData('1', true)]
+    [InlineData('0', false)]
+    [InlineData('m', false)]
+    [InlineData('?', false)]
+    public void Only_an_explicit_on_slot_confirms_mains_are_expected(char cell, bool expected)
+    {
+        var snap = Snap("A");
+        snap.Schedule!.Days[0].Queues["A"] = new string(cell, 24);
+        Assert.Equal(expected, View(snap, "2026-10-07 12:00").ExpectsMainsNow);
+    }
+
     // design.md §11 DTEK module, rules 1, 16
     [Fact]
     public void The_next_planned_outage_of_the_fixed_queue_with_both_times_and_the_source()

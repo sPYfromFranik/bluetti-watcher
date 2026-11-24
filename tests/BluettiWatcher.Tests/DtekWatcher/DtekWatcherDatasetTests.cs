@@ -46,4 +46,30 @@ public sealed class DtekWatcherDatasetTests
         var s = DtekParser.ParseDataset("""{"lastUpdated":"2026-10-07T10:06:14Z","fact":{"data":{"1791320400":{"GPV1.1":{"1":"no"}}},"update":"this morning"}}""", null).Schedule!;
         Assert.Equal(("this morning", null), (s.Update, s.UpdateAt));
     }
+
+    [Fact]
+    public void The_open_endpoint_format_keeps_only_status_one_outage_windows()
+    {
+        const string body = """
+            [
+              { "eventDate":"24.11.2026", "queues": { "4.1": [
+                { "from":"06:00", "to":"10:00", "status":1 },
+                { "from":"13:30", "to":"17:00", "status":1 },
+                { "from":"18:00", "to":"19:00", "status":0 },
+                { "from":"20:30", "to":"22:30", "status":1 }
+              ]}, "createdAt":"23.11.2026 20:55", "scheduleApprovedSince":"24.11.2026 21:55" },
+              { "eventDate":"25.11.2026", "queues": { "4.1": [
+                { "from":"12:00", "to":"14:00", "status":1 },
+                { "from":"22:00", "to":"00:00", "status":1 }
+              ]}, "createdAt":"24.11.2026 20:56" }
+            ]
+            """;
+
+        var r = DtekParser.ParseDataset(body, "\"schedule\"");
+
+        Assert.Equal(DtekStatus.Ok, r.Status);
+        Assert.Equal("endpoint", r.Schedule!.Source);
+        Assert.Equal("06:00-10:00, 13:30-17:00, 20:30-22:30", DtekTime.DayText(r.Schedule, "4.1", new DateTime(2026, 11, 24), Kyiv));
+        Assert.Equal("12:00-14:00, 22:00-24:00", DtekTime.DayText(r.Schedule, "4.1", new DateTime(2026, 11, 25), Kyiv));
+    }
 }
